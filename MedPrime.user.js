@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.1.0
+// @version      1.2.0
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @run-at       document-idle
@@ -15,7 +15,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.1.0';
+const VERSAO = '1.2.0';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 const API = 'https://plane.devstroupe.com/backend/';
 const KEY = 'medprime_estado_v1';
@@ -52,6 +52,42 @@ function mesclarDados(D) {
   S.mapa = D.mapa || S.mapa; S.logos = D.logos || S.logos; S.dadosVersao = D.versao;
   invalida(); _mapa = null; salvar();
   return { nb, na };
+}
+// ---------------- ajustes publicados pelo Claude (aplicados uma vez, guardados em S.ajustes)
+const AJUSTES = [
+  { id: '2026-11-05-fj-lucas', desc: 'FJ e Lucas da medição de 10/10/2026 iguais ao plane', ops: [
+    { id: 'x26', serv: '3 - Limpeza dos apartamentos', aba: 'FJ CONSTRUÇÕES', fora: 'o plane só pagou a limpeza de 2 × R$ 560 (medição 13634)' },
+    { id: 'x50', aba: 'LUCAS SERVIÇOS', servIni: '36 - 21.06.08', set: { qreal: 0.5 }, obsAdd: 'pago 50% (igual ao plane)' },
+    { id: 'x52', aba: 'LUCAS SERVIÇOS', servIni: '37 - 17.01.05', set: { qreal: 33.75 } },
+    { id: 'x53', aba: 'LUCAS SERVIÇOS', servIni: '38 - 17.01.04', set: { qreal: 4.3 } },
+    { id: 'x55', aba: 'LUCAS SERVIÇOS', servIni: '9 - Mão de obra empreitada para proteção', fora: 'não entrou na medição 13570 do plane' }
+  ], base: [{ aba: 'LUCAS SERVIÇOS', nAba: 37, qref: 33.75 }, { aba: 'LUCAS SERVIÇOS', nAba: 38, qref: 4.3 }] }
+];
+let AVISO = '';
+function aplicarAjustes() {
+  if (!S) return;
+  S.ajustes = S.ajustes || [];
+  AJUSTES.forEach(a => {
+    if (S.ajustes.indexOf(a.id) >= 0) return;
+    let n = 0;
+    (a.base || []).forEach(bq => {
+      const b = S.base.find(x => x.aba === bq.aba && x.nAba === bq.nAba); if (!b) return;
+      const lab = rotulo(b);
+      S.lanc.forEach(l => { if (l.aba === bq.aba && l.serv === lab && l.qreal == null && a.ops.every(o => o.id !== l.id)) l.qreal = b.qref; }); // congela os outros períodos
+      b.qref = bq.qref; n++;
+    });
+    a.ops.forEach(o => {
+      const l = S.lanc.find(x => x.id === o.id); if (!l || l.aba !== o.aba) return;
+      if (o.serv && l.serv !== o.serv) return; if (o.servIni && (l.serv || '').indexOf(o.servIni) !== 0) return;
+      if (o.fora) { l.fora = true; l.foraMotivo = o.fora; }
+      if (o.set) Object.assign(l, o.set);
+      if (o.obsAdd && (l.obs || '').indexOf(o.obsAdd) < 0) l.obs = (l.obs ? l.obs + ' · ' : '') + o.obsAdd;
+      n++;
+    });
+    S.ajustes.push(a.id); invalida();
+    if (n) AVISO = (AVISO ? AVISO + ' · ' : '') + a.desc;
+  });
+  salvar();
 }
 function ehBackup(o) { return o && o.v && Array.isArray(o.lanc) && Array.isArray(o.base); }
 function ehDados(o) { return o && !o.v && o.versao && Array.isArray(o.base) && Array.isArray(o.mapa); }
@@ -109,7 +145,7 @@ function calc(l) {
   return { it, un: un || '', preco, qapto, n, qt, valor };
 }
 function linhas(aba, per, tipo) {
-  return S.lanc.filter(l => l.aba === aba && l.per === per && (l.tipo || 'E') === (tipo || 'E'))
+  return S.lanc.filter(l => l.aba === aba && l.per === per && !l.fora && (l.tipo || 'E') === (tipo || 'E'))
     .sort((a, b) => (a.ord || 0) - (b.ord || 0));
 }
 function totais(aba, per) {
@@ -242,7 +278,8 @@ async function carregarPlane() {
   status(); render();
 }
 const abaDoSup = sup => S.sup[String(sup)] || '';
-function medPlane(aba, per) { return PL.med.filter(m => abaDoSup(m.sup) === aba && m.fim === per); }
+// medições do plane do empreiteiro no período; tipo 'P' = as que têm PREVISTA no título
+function medPlane(aba, per, tipo) { return PL.med.filter(m => abaDoSup(m.sup) === aba && m.fim === per && (/PREVIST/i.test(m.tit) ? 'P' : 'E') === (tipo || 'E')); }
 function stPt(s) { s = String(s || '').toUpperCase(); if (s === 'APPROVED') return 'APROVADA'; if (s.startsWith('WAI')) return 'AGUARDANDO ' + s.split('_').slice(1).join(' '); return s; }
 
 // ------------------------------------------------------------------ interface
@@ -313,7 +350,7 @@ function abrir() {
     <div class="per">Medição de <select id="selPer"></select></div>
     <div class="sp"></div>
     <span id="plst" style="font-size:11px;opacity:.9"></span>
-    <button class="btn w s" id="btPlane">↻ Atualizar plane</button>
+    <button class="btn w s" id="btPlane" title="Lê de novo as OS e as medições do plane (só leitura). Use depois de lançar ou aprovar algo lá.">↻ Atualizar plane</button>
     <button class="btn w s" id="btBkp">💾 Backup</button>
     <button class="btn x" id="btX" title="Fechar (volta ao plane)">✕</button>
   </div><div class="main"><div class="nav" id="nav"></div><div class="cnt" id="cnt"></div></div></div>`;
@@ -369,9 +406,10 @@ function vResumo() {
   const per = S.dataMed;
   let tb = 0, tr = 0, td = 0, tl = 0, tp = 0, tpb = 0, tpl = 0;
   const rows = S.abas.map(a => {
-    const t = totais(a.nome, per); const pm = medPlane(a.nome, per);
+    const t = totais(a.nome, per); const pm = medPlane(a.nome, per); const pp = medPlane(a.nome, per, 'P');
+    const ppb = pp.reduce((s, m) => s + m.bruto, 0);
     const pb = pm.reduce((s, m) => s + m.bruto, 0), pliq = pm.reduce((s, m) => s + m.liq - m.ded, 0);
-    if (!t.nEx && !t.nPv && !pm.length) return null;
+    if (!t.nEx && !t.nPv && !pm.length && !pp.length) return null;
     tb += t.bruto; tr += t.ret; td += t.desc; tl += t.liq; tp += t.prev; tpb += pb; tpl += pliq;
     let st;
     if (!pm.length) st = t.bruto > 0 ? '<span class="tag warn">PREPARADA</span>' : '';
@@ -380,11 +418,12 @@ function vResumo() {
     const dif = pm.length && t.bruto > 0 ? Math.round((t.bruto - pb) * 100) / 100 : null;
     return `<tr><td><span class="link" data-goto="lancar" data-aba="${esc(a.nome)}">${esc(a.nome)}</span></td><td>${esc(a.disc)}</td>
       <td class="n">${R$(t.bruto)}</td><td class="c">${pct(a.ret)}</td><td class="n">${R$(t.ret)}</td><td class="n">${R$(t.desc)}</td><td class="n"><b>${R$(t.liq)}</b></td>
-      <td class="n">${t.prev ? R$(t.prev) : ''}</td><td class="c">${st}</td><td class="n">${pm.length ? R$(pb) : ''}</td><td class="n">${pm.length ? R$(pliq) : ''}</td>
+      <td class="n">${t.prev ? R$(t.prev) : ''}${pp.length ? `<br><span class="tag ${Math.abs(ppb - t.prev) < 0.01 ? 'ok' : 'warn'}" title="medição prevista no plane">plane ${R$(ppb)}</span>` : ''}</td><td class="c">${st}</td><td class="n">${pm.length ? R$(pb) : ''}</td><td class="n">${pm.length ? R$(pliq) : ''}</td>
       <td class="c">${dif == null ? '' : Math.abs(dif) < 0.01 ? '<span class="tag ok">igual</span>' : `<span class="tag bad">${R$(dif)}</span>`}</td>
       <td class="c"><button class="btn s w" data-goto="conferir" data-aba="${esc(a.nome)}">conferir</button></td></tr>`;
   }).filter(Boolean);
-  return `<h2>Resumo da medição de ${br(per)} <span class="muted">(${br(iniDe(per))} a ${br(per)})</span></h2>
+  const av = AVISO ? `<div class="box" style="background:#E2EFDA;border-color:#A9D08E">✔ Ajuste aplicado nesta versão: <b>${esc(AVISO)}</b>. As linhas que não entraram no plane ficaram guardadas (não somam) no fim da tela Lançar.</div>` : '';
+  return av + `<h2>Resumo da medição de ${br(per)} <span class="muted">(${br(iniDe(per))} a ${br(per)})</span></h2>
   <div class="cards"><div class="card"><div class="l">Bruto executado</div><div class="v">${R$(tb)}</div></div>
   <div class="card"><div class="l">(–) Retenções</div><div class="v">${R$(tr)}</div></div><div class="card"><div class="l">(–) Descontos</div><div class="v">${R$(td)}</div></div>
   <div class="card gr"><div class="l">Líquido a pagar</div><div class="v">${R$(tl)}</div></div><div class="card"><div class="l">Previsto (separado)</div><div class="v">${R$(tp)}</div></div>
@@ -403,16 +442,17 @@ function vLancar() {
   const linha = (l, i, tipo) => {
     const c = calc(l); const fora = !c.it && !ehDesconto(l);
     return `<tr data-id="${l.id}"><td class="c">${i + 1}</td>
-      ${tipo === 'E' ? `<td style="width:92px"><input type="date" data-f="data" value="${esc(l.data || '')}"></td>` : ''}
-      <td style="min-width:340px"><input list="dl-serv" data-f="serv" value="${esc(l.serv)}" title="${esc(l.serv)}">${fora ? '<span class="tag warn" title="não está na base de preços desta aba">fora da base</span>' : ''}</td>
-      <td style="min-width:240px"><div style="display:flex;gap:4px;align-items:center"><textarea data-f="local" rows="2" style="flex:1">${esc(l.local)}</textarea><button class="btn s w" data-pick="${l.id}" title="escolher blocos/aptos no mapa">▦</button></div></td>
+      ${tipo === 'E' ? `<td style="width:118px"><input type="date" data-f="data" value="${esc(l.data || '')}"></td>` : ''}
+      <td style="min-width:280px"><input list="dl-serv" data-f="serv" value="${esc(l.serv)}" title="${esc(l.serv)}">${fora ? '<span class="tag warn" title="não está na base de preços desta aba">fora da base</span>' : ''}</td>
+      <td style="min-width:210px"><div style="display:flex;gap:4px;align-items:center"><textarea data-f="local" rows="2" style="flex:1">${esc(l.local)}</textarea><button class="btn s w" data-pick="${l.id}" title="escolher blocos/aptos no mapa">▦</button></div></td>
       <td style="width:64px"><input class="num" data-f="n" value="${l.n == null ? '' : Q(l.n)}"></td>
       <td style="width:70px"><input class="num" data-f="qreal" value="${l.qreal == null ? '' : Q(l.qreal)}" placeholder="${c.it && c.it.qref != null ? Q(c.it.qref) : ''}"></td>
-      <td style="min-width:140px"><input data-f="obs" value="${esc(l.obs)}"></td>
+      <td style="min-width:90px"><input data-f="obs" value="${esc(l.obs)}"></td>
       <td class="c">${esc(c.un)}</td><td class="n">${R4(c.preco)}</td><td class="n">${Q(c.qapto)}</td><td class="n">${Q(c.qt)}</td><td class="n"><b>${R$(c.valor)}</b></td>
       <td class="c" style="white-space:nowrap"><button class="btn s w" data-dup="${l.id}" title="duplicar">⧉</button> <button class="btn s r" data-del="${l.id}" title="apagar">✕</button></td></tr>`;
   };
   const ex = linhas(ABA, per, 'E'), pv = linhas(ABA, per, 'P');
+  const fora = S.lanc.filter(l => l.aba === ABA && l.per === per && l.fora);
   const hist = periodosDaAba(ABA).filter(p => p !== per).reverse();
   const head = tipo => `<tr><th>#</th>${tipo === 'E' ? '<th>Data</th>' : ''}<th>Serviço (digite p/ buscar)</th><th>Local / Bloco / Aptos</th><th>Nº aptos / vezes</th><th>Qtd/apto real</th><th>Observação</th><th>Unid</th><th>Preço</th><th>Qtd/apto</th><th>Qtd total</th><th>Valor</th><th></th></tr>`;
   return `<datalist id="dl-serv">${opts}</datalist>
@@ -428,6 +468,7 @@ function vLancar() {
   <div class="box" style="border-radius:0 0 8px 8px">Previsto até: <input type="date" id="prevAte" value="${esc((pv[0] && pv[0].data) || '')}" style="padding:4px"></div>
   <table class="t"><thead>${head('P')}</thead><tbody>${pv.map((l, i) => linha(l, i, 'P')).join('')}</tbody></table>
   <div style="margin:8px 0"><button class="btn w" data-add="P">+ Linha prevista</button></div>
+  ${fora.length ? `<div class="sec" style="background:#808080">LINHAS GUARDADAS QUE NÃO ENTRARAM NO PLANE (não somam)</div><table class="t"><thead><tr><th>Serviço</th><th>Local</th><th>Valor</th><th>Motivo</th><th></th></tr></thead><tbody>${fora.map(l => `<tr style="color:#777"><td>${esc(l.serv)}</td><td>${esc(l.local)}</td><td class="n">${R$(calc(Object.assign({}, l, { fora: false })).valor)}</td><td>${esc(l.foraMotivo || '')}</td><td class="c"><button class="btn s w" data-reat="${l.id}">voltar para a medição</button></td></tr>`).join('')}</tbody></table>` : ''}
   ${hist.length ? `<div class="sec" style="background:#595959">MEDIÇÕES ANTERIORES DESTE EMPREITEIRO</div><table class="t"><thead><tr><th>Medição</th><th>Linhas</th><th>Bruto</th><th>Líquido</th><th></th></tr></thead><tbody>${hist.map(p => { const tt = totais(ABA, p); return `<tr><td>${br(p)}</td><td class="c">${tt.nEx}</td><td class="n">${R$(tt.bruto)}</td><td class="n">${R$(tt.liq)}</td><td class="c"><button class="btn s w" data-irper="${p}">abrir</button></td></tr>`; }).join('')}</tbody></table>` : ''}
   <p class="muted">Tudo é salvo automaticamente no navegador a cada alteração. Faça o backup em arquivo de vez em quando (botão 💾).</p>`;
 }
@@ -748,10 +789,10 @@ function abrirPicker(id) {
 function abrirArquivo(o) {
   if (ehBackup(o)) {
     if (S && !confirm(`Restaurar o backup com ${o.lanc.length} lançamentos? O que está aqui agora será substituído.`)) return;
-    S = o; invalida(); _mapa = null; salvar(); VIEW = 'resumo'; render(); if (!PL.ok) carregarPlane(); return;
+    S = o; invalida(); _mapa = null; aplicarAjustes(); salvar(); VIEW = 'resumo'; render(); if (!PL.ok) carregarPlane(); return;
   }
   if (ehDados(o)) {
-    if (!S) { S = seedState(o); invalida(); _mapa = null; salvar(); VIEW = 'resumo'; render(); carregarPlane(); return; }
+    if (!S) { S = seedState(o); invalida(); _mapa = null; aplicarAjustes(); salvar(); VIEW = 'resumo'; render(); carregarPlane(); return; }
     if (!confirm('Juntar esta atualização de dados (' + o.versao + ')? Só entram itens e empreiteiros novos; seus lançamentos e preços editados ficam como estão.')) return;
     const r = mesclarDados(o); alert(`Pronto: ${r.nb} itens novos na base e ${r.na} empreiteiros novos.`); render(); return;
   }
@@ -764,7 +805,7 @@ function novaLinha(tipo) {
   const inp = $(`tr[data-id="${l.id}"] input[data-f="serv"]`); if (inp) inp.focus();
 }
 function onClick(e) {
-  const t = e.target.closest('[data-view],[data-goto],[data-add],[data-del],[data-dup],[data-pick],[data-print],[data-act],[data-irper]');
+  const t = e.target.closest('[data-view],[data-goto],[data-add],[data-del],[data-dup],[data-pick],[data-print],[data-act],[data-irper],[data-reat]');
   if (!t) return;
   const d = t.dataset;
   if (d.view) { VIEW = d.view; render(); return; }
@@ -773,6 +814,7 @@ function onClick(e) {
   if (d.del) { const l = S.lanc.find(x => x.id === d.del); if (l && confirm('Apagar a linha "' + (l.serv || '') + '"?')) { S.lanc = S.lanc.filter(x => x.id !== d.del); salvar(); render(); } return; }
   if (d.dup) { const l = S.lanc.find(x => x.id === d.dup); if (l) { const c = Object.assign({}, l, { id: uid(), ord: (l.ord || 0) + 0.5, fonte: 'medprime' }); S.lanc.push(c); salvar(); render(); } return; }
   if (d.pick) { abrirPicker(d.pick); return; }
+  if (d.reat) { const l = S.lanc.find(x => x.id === d.reat); if (l) { l.fora = false; salvar(); render(); } return; }
   if (d.print) { imprimir(d.print); return; }
   if (d.irper) { S.dataMed = d.irper; salvar(); render(); return; }
   if (d.act === 'plane') { carregarPlane(); return; }
@@ -863,6 +905,7 @@ function fab() {
 }
 S = store.get();
 if (!S || !S.v) S = null;
+aplicarAjustes();
 setInterval(fab, 1500); fab();
 W.__MedPrime = { abrir, versao: VERSAO, estado: () => S, _t: { qtdAptosDoLocal, chavesDaLinha, calc, totais, perDe, iniDe } };
 })();
