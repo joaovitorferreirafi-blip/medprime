@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.2.0
+// @version      1.3.0
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @run-at       document-idle
@@ -15,7 +15,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.2.0';
+const VERSAO = '1.3.0';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 const API = 'https://plane.devstroupe.com/backend/';
 const KEY = 'medprime_estado_v1';
@@ -264,8 +264,8 @@ async function carregarPlane() {
     });
     const med = (me.items || []).map(m => {
       if (m.supplier) sups[m.supplier_id] = m.supplier.company;
-      const it = (m.input_measurements || []).map(i => ({ isoi: i.input_id, q: +i.quantity, p: +i.price, desc: i.description || i.item || '' }));
-      it.forEach(i => { if (itens[i.isoi]) itens[i.isoi].medido += i.q; });
+      const it = (m.input_measurements || []).map(i => ({ isoi: i.input_id, q: +i.quantity, p: +i.price, desc: i.description || i.item || '', un: (i.input && i.input.input && i.input.input.unity) || '' }));
+      it.forEach(i => { if (itens[i.isoi]) { itens[i.isoi].medido += i.q; if (i.un && !itens[i.isoi].un) itens[i.isoi].un = i.un; } });
       const bruto = it.reduce((s, i) => s + i.q * i.p, 0);
       return { id: m.measurement_id, so: m.service_order_id, sup: m.supplier_id, ini: (m.start || '').slice(0, 10), fim: (m.end || '').slice(0, 10),
         tit: m.title || '', st: m.status || '', bruto, liq: +m.inputs_total_value || 0, ded: +m.deductions_total_value || 0,
@@ -275,9 +275,92 @@ async function carregarPlane() {
   } catch (e) {
     PL.carregando = false; PL.erro = e.message;
   }
+  if (PL.ok && S) { try { sincronizarBase(); } catch (e) { console.error('MedPrime sync', e); } }
   status(); render();
 }
 const abaDoSup = sup => S.sup[String(sup)] || '';
+
+// ---------------- base de preços sempre igual ao plane (automático a cada leitura do plane)
+let NOVIDADES = null;
+const tok = s => new Set(semac(s).replace(/[^A-Z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 2));
+function simil(a, b) { const A = tok(a), B = tok(b); if (!A.size || !B.size) return 0; let n = 0; A.forEach(w => { if (B.has(w)) n++; }); return n / (A.size + B.size - n); }
+function unDoTexto(t) {
+  const s = semac(t);
+  if (/\bM(²|2)\b|M2\b|METRO QUADRADO/.test(String(t).toUpperCase()) || /\bM2\b/.test(s)) return 'M²';
+  if (/\bM(³|3)\b|\bM3\b/.test(String(t).toUpperCase())) return 'M³';
+  if (/\bML\b|METRO LINEAR/.test(s)) return 'M';
+  if (/\bDIARIA/.test(s)) return 'DIA'; if (/\bMES\b|MENSAL/.test(s)) return 'MÊS'; if (/\bVERBA\b|\bVB\b/.test(s)) return 'VB';
+  return '';
+}
+function perAtual() { return perDe(isoD(new Date())); }
+function congelarAntigas(b) {
+  const lab = rotulo(b), pa = perAtual(); let n = 0;
+  S.lanc.forEach(l => {
+    if (l.aba !== b.aba || l.serv !== lab || l.frozen || l.fonte === 'arquivo' || !(l.per < pa)) return;
+    l.frozen = true; l.preco = b.preco; l.un = b.un; if (l.qreal == null) l.qreal = b.qref == null ? 1 : b.qref; n++;
+  });
+  return n;
+}
+function aplicarPreco(b, novo, agora, nov) {
+  const de = b.preco; congelarAntigas(b); b.preco = novo; b.precoPlaneEm = agora || new Date().toISOString();
+  const e = { em: b.precoPlaneEm, tipo: 'preco', aba: b.aba, serv: b.serv, de, para: novo, isoi: b.isoi }; S.logBase = S.logBase || []; S.logBase.push(e); if (nov) nov.precos.push(e);
+  invalida();
+}
+function sincronizarBase() {
+  S.logBase = S.logBase || []; S.ocultosPlane = S.ocultosPlane || [];
+  const agora = new Date().toISOString(); const nov = { novos: [], precos: [], ligados: [], conferir: [], semAba: {} };
+  const ligados = new Set(S.base.filter(b => b.isoi).map(b => Number(b.isoi)));
+  // 1) preços: quando o preço MUDA no plane, a base acompanha sozinha.
+  //    Diferenças antigas (de antes do MedPrime ler o plane pela 1ª vez) ficam para você confirmar com um clique.
+  S.planePreco = S.planePreco || {};
+  const vistoAntes = Object.assign({}, S.planePreco);
+  S.base.forEach(b => {
+    const pi = b.isoi ? PL.itens[b.isoi] : null; if (!pi || !isFinite(pi.preco)) return;
+    const visto = vistoAntes[pi.isoi];
+    const mudouNoPlane = visto != null && Math.abs(pi.preco - visto) > 0.00005;
+    if (b.preco != null && Math.abs(pi.preco - b.preco) <= 0.00005) return;
+    if (mudouNoPlane && b.vinc !== 'conferir') { aplicarPreco(b, pi.preco, agora, nov); return; }
+    nov.conferir.push({ id: b.id, aba: b.aba, serv: b.serv, de: b.preco, para: pi.preco, isoi: b.isoi });
+  });
+  Object.values(PL.itens).forEach(pi => { S.planePreco[pi.isoi] = pi.preco; });
+  // 2) itens das OS ativas que ainda não estão na base
+  Object.values(PL.itens).forEach(pi => {
+    if (!pi.ativo || ligados.has(Number(pi.isoi)) || S.ocultosPlane.indexOf(pi.isoi) >= 0) return;
+    const aba = abaDoSup(pi.sup);
+    if (!aba) { const nm = PL.sups[pi.sup] || ('fornecedor ' + pi.sup); nov.semAba[pi.sup] = nov.semAba[pi.sup] || { nome: nm, n: 0 }; nov.semAba[pi.sup].n++; return; }
+    const nome = pi.item || pi.desc;
+    // tenta ligar a um item da base sem vínculo (mesmo empreiteiro, mesmo preço, nome parecido)
+    let best = null, bs = 0;
+    S.base.forEach(b => { if (b.aba !== aba || (b.isoi && PL.itens[b.isoi])) return; if (b.preco == null || Math.abs(b.preco - pi.preco) > 0.00005) return; const sc = Math.max(simil(b.serv, nome), simil(b.serv, pi.desc)); if (sc > bs) { bs = sc; best = b; } });
+    if (best && bs >= 0.5) { best.isoi = pi.isoi; best.vinc = 'auto-plane'; ligados.add(Number(pi.isoi)); const e = { em: agora, tipo: 'ligado', aba, serv: best.serv, isoi: pi.isoi }; nov.ligados.push(e); S.logBase.push(e); return; }
+    let serv = nome;
+    if (pi.desc && semac(pi.desc) !== semac(nome)) serv += ' — ' + pi.desc.replace(/\s+/g, ' ').trim().slice(0, 160);
+    const nAba = Math.max(0, ...S.base.filter(b => b.aba === aba).map(b => +b.nAba || 0)) + 1;
+    const id = Math.max(0, ...S.base.map(b => +b.id || 0)) + 1;
+    const a = S.abas.find(x => x.nome === aba) || {};
+    const b = { id, n: Math.max(0, ...S.base.map(x => +x.n || 0)) + 1, disc: a.disc || '', emp: aba, etapa: 'OS ' + pi.so, serv, un: pi.un || unDoTexto(nome + ' ' + pi.desc) || 'UN',
+      preco: pi.preco, qref: null, sit: 'Ativo', aba, isoi: pi.isoi, vinc: 'plane', nAba, doPlane: agora };
+    S.base.push(b); ligados.add(Number(pi.isoi));
+    const e = { em: agora, tipo: 'novo', aba, serv, para: pi.preco, isoi: pi.isoi }; nov.novos.push(e); S.logBase.push(e);
+  });
+  if (S.logBase.length > 600) S.logBase = S.logBase.slice(-600);
+  invalida();
+  if (nov.novos.length || nov.precos.length || nov.ligados.length) salvar();
+  NOVIDADES = nov;
+}
+function boxNovidades(curto) {
+  const n = NOVIDADES; if (!n) return '';
+  const sa = Object.keys(n.semAba);
+  if (!n.novos.length && !n.precos.length && !n.ligados.length && !n.conferir.length && !sa.length) return '';
+  const lista = (arr, f) => arr.slice(0, curto ? 0 : 60).map(f).join('');
+  return `<div class="box" style="background:#EAF3FB;border-color:#9DC3E6"><b>🔄 Base de preços atualizada pelo plane</b> (${PL.em ? PL.em.toLocaleTimeString('pt-BR').slice(0, 5) : ''}):
+    ${n.novos.length} serviço(s) novo(s) das OS · ${n.precos.length} preço(s) atualizado(s) · ${n.ligados.length} item(ns) ligado(s) à OS${n.conferir.length ? ` · <span style="color:#9C5700">${n.conferir.length} preço(s) da base diferente(s) do plane para você confirmar</span>` : ''}
+    ${curto ? ' — <span class="link" data-goto="base">ver detalhes na Base de preços</span>' : ''}
+    ${sa.length ? `<br><span style="color:#9C0006">Fornecedor(es) com OS no plane e sem empreiteiro aqui: ${sa.map(k => `<b>${esc(n.semAba[k].nome)}</b> (${n.semAba[k].n} itens) <button class="btn s w" data-criaemp="${k}">criar empreiteiro</button>`).join(' ')}</span>` : ''}
+    ${curto ? '' : `<div style="max-height:260px;overflow:auto;margin-top:6px">${lista(n.novos, e => `<div>➕ <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.para)} <span class="muted">(item OS ${e.isoi})</span> <button class="btn s w" data-ocultar="${e.isoi}" title="tirar da base (não volta mais)">não usar</button></div>`)}${lista(n.precos, e => `<div>💲 <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.de)} → <b>${R4(e.para)}</b></div>`)}${lista(n.ligados, e => `<div>🔗 <b>${esc(e.aba)}</b>: ${esc(e.serv)} ligado ao item OS ${e.isoi}</div>`)}</div>${n.conferir.length ? `<div style="margin-top:8px"><b style="color:#9C5700">⚠ Preço da base diferente do plane (diferenças antigas ou vínculo a conferir) — confira e confirme:</b> <button class="btn s" data-act="usartodos">usar o preço do plane em todos</button>
+      <div style="max-height:260px;overflow:auto;margin-top:4px">${n.conferir.map(e => `<div>${esc(e.aba)}: ${esc(e.serv.slice(0, 90))} — base <b>${R4(e.de)}</b> × plane <b>${R4(e.para)}</b> <span class="muted">(item OS ${e.isoi})</span> <button class="btn s w" data-usarpreco="${e.id}">usar o do plane</button></div>`).join('')}</div></div>` : ''}`}
+  </div>`;
+}
 // medições do plane do empreiteiro no período; tipo 'P' = as que têm PREVISTA no título
 function medPlane(aba, per, tipo) { return PL.med.filter(m => abaDoSup(m.sup) === aba && m.fim === per && (/PREVIST/i.test(m.tit) ? 'P' : 'E') === (tipo || 'E')); }
 function stPt(s) { s = String(s || '').toUpperCase(); if (s === 'APPROVED') return 'APROVADA'; if (s.startsWith('WAI')) return 'AGUARDANDO ' + s.split('_').slice(1).join(' '); return s; }
@@ -423,7 +506,7 @@ function vResumo() {
       <td class="c"><button class="btn s w" data-goto="conferir" data-aba="${esc(a.nome)}">conferir</button></td></tr>`;
   }).filter(Boolean);
   const av = AVISO ? `<div class="box" style="background:#E2EFDA;border-color:#A9D08E">✔ Ajuste aplicado nesta versão: <b>${esc(AVISO)}</b>. As linhas que não entraram no plane ficaram guardadas (não somam) no fim da tela Lançar.</div>` : '';
-  return av + `<h2>Resumo da medição de ${br(per)} <span class="muted">(${br(iniDe(per))} a ${br(per)})</span></h2>
+  return av + boxNovidades(true) + `<h2>Resumo da medição de ${br(per)} <span class="muted">(${br(iniDe(per))} a ${br(per)})</span></h2>
   <div class="cards"><div class="card"><div class="l">Bruto executado</div><div class="v">${R$(tb)}</div></div>
   <div class="card"><div class="l">(–) Retenções</div><div class="v">${R$(tr)}</div></div><div class="card"><div class="l">(–) Descontos</div><div class="v">${R$(td)}</div></div>
   <div class="card gr"><div class="l">Líquido a pagar</div><div class="v">${R$(tl)}</div></div><div class="card"><div class="l">Previsto (separado)</div><div class="v">${R$(tp)}</div></div>
@@ -669,12 +752,16 @@ function vBase() {
   const lista = S.base.filter(b => (!FILTRO_ABA || b.aba === FILTRO_ABA) && (!q || semac(b.serv + ' ' + b.aba + ' ' + b.etapa).indexOf(q) >= 0));
   const rows = lista.slice(0, 400).map(b => {
     const pi = b.isoi ? PL.itens[b.isoi] : null;
-    const st = !b.isoi ? '<span class="tag bad">NÃO ESTÁ NA OS</span>' : !PL.ok ? '' : !pi ? '<span class="tag warn">não achado</span>' : Math.abs(pi.preco - (b.preco || 0)) > 0.00005 ? '<span class="tag warn">PREÇO DIFERENTE</span>' : b.vinc === 'conferir' ? '<span class="tag warn">CONFERIR NOME</span>' : '<span class="tag ok">OK</span>';
+    const st0 = b.doPlane ? '<span class="tag info">NOVO DO PLANE</span> ' : '';
+    const st = st0 + (!b.isoi ? '<span class="tag bad">NÃO ESTÁ NA OS</span>' : !PL.ok ? '' : !pi ? '<span class="tag warn">não achado</span>' : Math.abs(pi.preco - (b.preco || 0)) > 0.00005 ? '<span class="tag warn">PREÇO DIFERENTE</span>' : b.vinc === 'conferir' ? '<span class="tag warn">CONFERIR NOME</span>' : '<span class="tag ok">OK</span>');
     return `<tr data-bid="${b.id}"><td class="c">${b.n || ''}</td><td>${esc(b.aba)}</td><td class="c">${b.nAba || ''}</td><td style="min-width:300px"><input data-b="serv" value="${esc(b.serv)}"></td><td style="width:60px"><input data-b="un" value="${esc(b.un)}"></td>
      <td style="width:100px"><input class="num" data-b="preco" value="${b.preco == null ? '' : NF4.format(b.preco)}"></td><td style="width:80px"><input class="num" data-b="qref" value="${b.qref == null ? '' : Q(b.qref)}"></td>
      <td style="width:80px"><input class="num" data-b="isoi" value="${b.isoi || ''}"></td><td>${pi ? esc(pi.item) : ''}</td><td class="n">${pi ? R4(pi.preco) : ''}</td><td class="c">${st}</td></tr>`;
   }).join('');
-  return `<h2>Base de preços</h2>
+  const ult = (S.logBase || []).slice(-40).reverse();
+  return `<h2>Base de preços</h2>${boxNovidades(false)}
+  <div class="box muted">A base é atualizada sozinha toda vez que o MedPrime lê o plane: serviço novo em OS entra aqui já ligado ao item, e preço mudado no plane troca aqui (as medições de meses anteriores ficam com o preço da época). Itens novos vêm sem "Qtd ref." — preencha quando o serviço for por apto.
+  ${ult.length ? `<details style="margin-top:4px"><summary class="link">histórico das últimas atualizações automáticas</summary>${ult.map(e => `<div>${br(e.em.slice(0, 10))} · ${e.tipo === 'novo' ? '➕ novo' : e.tipo === 'preco' ? '💲 preço ' + R4(e.de) + ' → ' + R4(e.para) : '🔗 ligado'} · ${esc(e.aba)}: ${esc(e.serv)}</div>`).join('')}</details>` : ''}</div>
   <div class="bar"><label>Buscar</label><input id="busca" value="${esc(BUSCA)}" placeholder="parte do nome do serviço…" style="width:280px">
    <label>Aba</label><select data-act="fabase"><option value="">todas</option>${S.abas.map(a => `<option ${a.nome === FILTRO_ABA ? 'selected' : ''}>${esc(a.nome)}</option>`).join('')}</select>
    <span style="flex:1"></span><span class="muted">${lista.length} itens${lista.length > 400 ? ' (mostrando 400)' : ''}</span><button class="btn" data-act="novoitem">+ Novo item${FILTRO_ABA ? ' em ' + esc(FILTRO_ABA) : ''}</button></div>
@@ -805,7 +892,7 @@ function novaLinha(tipo) {
   const inp = $(`tr[data-id="${l.id}"] input[data-f="serv"]`); if (inp) inp.focus();
 }
 function onClick(e) {
-  const t = e.target.closest('[data-view],[data-goto],[data-add],[data-del],[data-dup],[data-pick],[data-print],[data-act],[data-irper],[data-reat]');
+  const t = e.target.closest('[data-view],[data-goto],[data-add],[data-del],[data-dup],[data-pick],[data-print],[data-act],[data-irper],[data-reat],[data-ocultar],[data-criaemp],[data-usarpreco]');
   if (!t) return;
   const d = t.dataset;
   if (d.view) { VIEW = d.view; render(); return; }
@@ -814,6 +901,26 @@ function onClick(e) {
   if (d.del) { const l = S.lanc.find(x => x.id === d.del); if (l && confirm('Apagar a linha "' + (l.serv || '') + '"?')) { S.lanc = S.lanc.filter(x => x.id !== d.del); salvar(); render(); } return; }
   if (d.dup) { const l = S.lanc.find(x => x.id === d.dup); if (l) { const c = Object.assign({}, l, { id: uid(), ord: (l.ord || 0) + 0.5, fonte: 'medprime' }); S.lanc.push(c); salvar(); render(); } return; }
   if (d.pick) { abrirPicker(d.pick); return; }
+  if (d.usarpreco || d.act === 'usartodos') {
+    const alvo = d.usarpreco ? NOVIDADES.conferir.filter(e => String(e.id) === d.usarpreco) : NOVIDADES.conferir.slice();
+    if (d.act === 'usartodos' && !confirm(`Trocar ${alvo.length} preço(s) da base pelo preço do plane? As medições de meses anteriores ficam com o preço antigo.`)) return;
+    alvo.forEach(e => { const b = S.base.find(x => String(x.id) === String(e.id)); if (b) { aplicarPreco(b, e.para, null, NOVIDADES); if (b.vinc === 'conferir') b.vinc = 'confirmado'; } });
+    NOVIDADES.conferir = NOVIDADES.conferir.filter(e => alvo.indexOf(e) < 0); salvar(); render(); return;
+  }
+  if (d.ocultar) {
+    const isoi = Number(d.ocultar); const b = S.base.find(x => Number(x.isoi) === isoi && x.doPlane);
+    if (b && S.lanc.some(l => l.aba === b.aba && l.serv === rotulo(b))) { alert('Esse serviço já tem lançamento; não dá para tirar da base.'); return; }
+    if (b) S.base = S.base.filter(x => x !== b);
+    S.ocultosPlane = S.ocultosPlane || []; S.ocultosPlane.push(isoi);
+    if (NOVIDADES) NOVIDADES.novos = NOVIDADES.novos.filter(x => Number(x.isoi) !== isoi);
+    invalida(); salvar(); render(); return;
+  }
+  if (d.criaemp) {
+    const nm0 = (PL.sups[d.criaemp] || '').toUpperCase().replace(/\b(LTDA|ME|EIRELI|S\/?A)\b\.?/g, '').replace(/\s+/g, ' ').trim();
+    const nm = (prompt('Nome do empreiteiro (aba) para ' + (PL.sups[d.criaemp] || d.criaemp) + ':', nm0) || '').trim().toUpperCase(); if (!nm) return;
+    if (!S.abas.find(a => a.nome === nm)) S.abas.push({ nome: nm, titulo: PL.sups[d.criaemp] || nm, disc: '', ret: 0.05 });
+    S.sup[String(d.criaemp)] = nm; salvar(); sincronizarBase(); render(); return;
+  }
   if (d.reat) { const l = S.lanc.find(x => x.id === d.reat); if (l) { l.fora = false; salvar(); render(); } return; }
   if (d.print) { imprimir(d.print); return; }
   if (d.irper) { S.dataMed = d.irper; salvar(); render(); return; }
