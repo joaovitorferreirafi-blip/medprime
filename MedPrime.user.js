@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.3.0
+// @version      1.4.0
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @run-at       document-idle
@@ -15,7 +15,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.3.0';
+const VERSAO = '1.4.0';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 const API = 'https://plane.devstroupe.com/backend/';
 const KEY = 'medprime_estado_v1';
@@ -292,6 +292,14 @@ function unDoTexto(t) {
   if (/\bDIARIA/.test(s)) return 'DIA'; if (/\bMES\b|MENSAL/.test(s)) return 'MÊS'; if (/\bVERBA\b|\bVB\b/.test(s)) return 'VB';
   return '';
 }
+// a base pode ter o preço "adotado" (ex.: diária R$ 3.000) e a OS outro preço com quantidade fracionada (R$ 60.000 × 0,05):
+// é o mesmo valor. Compara preço × quantidade de referência da base com preço × quantidade da OS.
+function equivalente(b, pi) {
+  if (!b || !pi || b.preco == null || !isFinite(pi.preco) || !isFinite(pi.qtd)) return false;
+  const vb = b.preco * (b.qref ? b.qref : 1), vp = pi.preco * pi.qtd;
+  return Math.abs(vb - vp) <= Math.max(0.02, 0.005 * Math.max(Math.abs(vb), Math.abs(vp)));
+}
+function precoIgual(b, pi) { return b && pi && b.preco != null && Math.abs(pi.preco - b.preco) <= 0.00005; }
 function perAtual() { return perDe(isoD(new Date())); }
 function congelarAntigas(b) {
   const lab = rotulo(b), pa = perAtual(); let n = 0;
@@ -318,34 +326,65 @@ function sincronizarBase() {
     const pi = b.isoi ? PL.itens[b.isoi] : null; if (!pi || !isFinite(pi.preco)) return;
     const visto = vistoAntes[pi.isoi];
     const mudouNoPlane = visto != null && Math.abs(pi.preco - visto) > 0.00005;
-    if (b.preco != null && Math.abs(pi.preco - b.preco) <= 0.00005) return;
-    if (mudouNoPlane && b.vinc !== 'conferir') { aplicarPreco(b, pi.preco, agora, nov); return; }
-    nov.conferir.push({ id: b.id, aba: b.aba, serv: b.serv, de: b.preco, para: pi.preco, isoi: b.isoi });
+    if (mudouNoPlane && b.vinc !== 'conferir') {
+      // mantém a proporção quando a base usa preço adotado (equivalente) — senão vira o preço do plane
+      const novo = precoIgual(b, { preco: visto }) ? pi.preco : Math.round(b.preco * pi.preco / visto * 10000) / 10000;
+      aplicarPreco(b, novo, agora, nov); return;
+    }
+    if (precoIgual(b, pi) || equivalente(b, pi)) return;
+    nov.conferir.push({ id: b.id, aba: b.aba, serv: b.serv, de: b.preco, para: pi.preco, isoi: b.isoi, qb: b.qref || 1, qp: pi.qtd });
   });
   Object.values(PL.itens).forEach(pi => { S.planePreco[pi.isoi] = pi.preco; });
-  // 2) itens das OS ativas que ainda não estão na base
-  Object.values(PL.itens).forEach(pi => {
-    if (!pi.ativo || ligados.has(Number(pi.isoi)) || S.ocultosPlane.indexOf(pi.isoi) >= 0) return;
+  // 2) itens das OS ativas que ainda não estão na base.
+  //    Antes de criar, tenta ligar a um item da base sem vínculo do mesmo empreiteiro com o MESMO VALOR
+  //    (preço igual, ou preço × quantidade igual) e nome parecido. Itens criados antes pelo plane e ainda
+  //    não usados entram de novo nessa conferência (limpa duplicados da versão 1.3.0).
+  const usado = b => S.lanc.some(l => l.aba === b.aba && l.serv === rotulo(b));
+  const reav = S.base.filter(b => b.doPlane && !usado(b));
+  const reavPorIsoi = {}; reav.forEach(b => { reavPorIsoi[b.isoi] = b; });
+  S.base = S.base.filter(b => reav.indexOf(b) < 0);
+  const lig2 = new Set(S.base.filter(b => b.isoi && PL.itens[b.isoi]).map(b => Number(b.isoi)));
+  const pend = Object.values(PL.itens).filter(pi => pi.ativo && !lig2.has(Number(pi.isoi)) && S.ocultosPlane.indexOf(pi.isoi) < 0);
+  const pares = [];
+  pend.forEach(pi => {
+    const aba = abaDoSup(pi.sup); if (!aba) return;
+    S.base.forEach(b => {
+      if (b.aba !== aba || (b.isoi && PL.itens[b.isoi])) return;
+      if (!(precoIgual(b, pi) || equivalente(b, pi))) return;
+      const sc = Math.max(simil(b.serv, pi.item), simil(b.serv, pi.desc), simil(b.serv, pi.item + ' ' + pi.desc));
+      if (sc >= 0.3) pares.push({ pi, b, sc });
+    });
+  });
+  pares.sort((x, y) => y.sc - x.sc);
+  const usadoB = new Set(), usadoP = new Set();
+  pares.forEach(({ pi, b }) => {
+    if (usadoB.has(b) || usadoP.has(pi.isoi)) return;
+    usadoB.add(b); usadoP.add(pi.isoi);
+    b.isoi = pi.isoi; b.vinc = 'auto-plane'; lig2.add(Number(pi.isoi));
+    const e = { em: agora, tipo: 'ligado', aba: b.aba, serv: b.serv, isoi: pi.isoi }; nov.ligados.push(e); S.logBase.push(e);
+  });
+  pend.forEach(pi => {
+    if (lig2.has(Number(pi.isoi))) return;
     const aba = abaDoSup(pi.sup);
     if (!aba) { const nm = PL.sups[pi.sup] || ('fornecedor ' + pi.sup); nov.semAba[pi.sup] = nov.semAba[pi.sup] || { nome: nm, n: 0 }; nov.semAba[pi.sup].n++; return; }
+    if (reavPorIsoi[pi.isoi]) { S.base.push(reavPorIsoi[pi.isoi]); lig2.add(Number(pi.isoi)); return; }
     const nome = pi.item || pi.desc;
-    // tenta ligar a um item da base sem vínculo (mesmo empreiteiro, mesmo preço, nome parecido)
-    let best = null, bs = 0;
-    S.base.forEach(b => { if (b.aba !== aba || (b.isoi && PL.itens[b.isoi])) return; if (b.preco == null || Math.abs(b.preco - pi.preco) > 0.00005) return; const sc = Math.max(simil(b.serv, nome), simil(b.serv, pi.desc)); if (sc > bs) { bs = sc; best = b; } });
-    if (best && bs >= 0.5) { best.isoi = pi.isoi; best.vinc = 'auto-plane'; ligados.add(Number(pi.isoi)); const e = { em: agora, tipo: 'ligado', aba, serv: best.serv, isoi: pi.isoi }; nov.ligados.push(e); S.logBase.push(e); return; }
     let serv = nome;
     if (pi.desc && semac(pi.desc) !== semac(nome)) serv += ' — ' + pi.desc.replace(/\s+/g, ' ').trim().slice(0, 160);
-    const nAba = Math.max(0, ...S.base.filter(b => b.aba === aba).map(b => +b.nAba || 0)) + 1;
-    const id = Math.max(0, ...S.base.map(b => +b.id || 0)) + 1;
+    const nAba = Math.max(0, ...S.base.filter(b => b.aba === aba).map(b => +b.nAba || 0), ...reav.filter(b => b.aba === aba).map(b => +b.nAba || 0)) + 1;
+    const id = Math.max(0, ...S.base.map(b => +b.id || 0), ...reav.map(b => +b.id || 0)) + 1;
     const a = S.abas.find(x => x.nome === aba) || {};
     const b = { id, n: Math.max(0, ...S.base.map(x => +x.n || 0)) + 1, disc: a.disc || '', emp: aba, etapa: 'OS ' + pi.so, serv, un: pi.un || unDoTexto(nome + ' ' + pi.desc) || 'UN',
       preco: pi.preco, qref: null, sit: 'Ativo', aba, isoi: pi.isoi, vinc: 'plane', nAba, doPlane: agora };
-    S.base.push(b); ligados.add(Number(pi.isoi));
+    S.base.push(b); lig2.add(Number(pi.isoi));
     const e = { em: agora, tipo: 'novo', aba, serv, para: pi.preco, isoi: pi.isoi }; nov.novos.push(e); S.logBase.push(e);
   });
+  // itens criados pelo plane que agora foram ligados a um item antigo saem da base (duplicados)
+  const tirados = reav.filter(b => S.base.indexOf(b) < 0).length;
+  if (tirados) nov.duplicados = tirados;
   if (S.logBase.length > 600) S.logBase = S.logBase.slice(-600);
   invalida();
-  if (nov.novos.length || nov.precos.length || nov.ligados.length) salvar();
+  if (nov.novos.length || nov.precos.length || nov.ligados.length || nov.duplicados) salvar();
   NOVIDADES = nov;
 }
 function boxNovidades(curto) {
@@ -353,12 +392,15 @@ function boxNovidades(curto) {
   const sa = Object.keys(n.semAba);
   if (!n.novos.length && !n.precos.length && !n.ligados.length && !n.conferir.length && !sa.length) return '';
   const lista = (arr, f) => arr.slice(0, curto ? 0 : 60).map(f).join('');
-  return `<div class="box" style="background:#EAF3FB;border-color:#9DC3E6"><b>🔄 Base de preços atualizada pelo plane</b> (${PL.em ? PL.em.toLocaleTimeString('pt-BR').slice(0, 5) : ''}):
-    ${n.novos.length} serviço(s) novo(s) das OS · ${n.precos.length} preço(s) atualizado(s) · ${n.ligados.length} item(ns) ligado(s) à OS${n.conferir.length ? ` · <span style="color:#9C5700">${n.conferir.length} preço(s) da base diferente(s) do plane para você confirmar</span>` : ''}
+  const sig = [n.novos.length, n.precos.length, n.ligados.length, n.conferir.length, sa.length, (S.logBase || []).length].join('|');
+  if (S.avisoFechado === sig) return '';
+  return `<div class="box" style="background:#EAF3FB;border-color:#9DC3E6;position:relative"><button class="btn x" data-fechar="${sig}" title="fechar este aviso" style="position:absolute;right:6px;top:2px;color:#1F3864;font-size:16px">✕</button><b>🔄 Base de preços atualizada pelo plane</b> (${PL.em ? PL.em.toLocaleTimeString('pt-BR').slice(0, 5) : ''}):
+    ${n.novos.length} serviço(s) novo(s) das OS · ${n.precos.length} preço(s) atualizado(s) · ${n.ligados.length} item(ns) da base ligado(s) à OS${n.duplicados ? ` · ${n.duplicados} duplicado(s) da versão anterior removido(s)` : ''}${n.conferir.length ? ` · <span style="color:#9C5700">${n.conferir.length} preço(s) da base diferente(s) do plane para você confirmar</span>` : ''}
     ${curto ? ' — <span class="link" data-goto="base">ver detalhes na Base de preços</span>' : ''}
     ${sa.length ? `<br><span style="color:#9C0006">Fornecedor(es) com OS no plane e sem empreiteiro aqui: ${sa.map(k => `<b>${esc(n.semAba[k].nome)}</b> (${n.semAba[k].n} itens) <button class="btn s w" data-criaemp="${k}">criar empreiteiro</button>`).join(' ')}</span>` : ''}
-    ${curto ? '' : `<div style="max-height:260px;overflow:auto;margin-top:6px">${lista(n.novos, e => `<div>➕ <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.para)} <span class="muted">(item OS ${e.isoi})</span> <button class="btn s w" data-ocultar="${e.isoi}" title="tirar da base (não volta mais)">não usar</button></div>`)}${lista(n.precos, e => `<div>💲 <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.de)} → <b>${R4(e.para)}</b></div>`)}${lista(n.ligados, e => `<div>🔗 <b>${esc(e.aba)}</b>: ${esc(e.serv)} ligado ao item OS ${e.isoi}</div>`)}</div>${n.conferir.length ? `<div style="margin-top:8px"><b style="color:#9C5700">⚠ Preço da base diferente do plane (diferenças antigas ou vínculo a conferir) — confira e confirme:</b> <button class="btn s" data-act="usartodos">usar o preço do plane em todos</button>
-      <div style="max-height:260px;overflow:auto;margin-top:4px">${n.conferir.map(e => `<div>${esc(e.aba)}: ${esc(e.serv.slice(0, 90))} — base <b>${R4(e.de)}</b> × plane <b>${R4(e.para)}</b> <span class="muted">(item OS ${e.isoi})</span> <button class="btn s w" data-usarpreco="${e.id}">usar o do plane</button></div>`).join('')}</div></div>` : ''}`}
+    ${curto ? '' : `<div style="max-height:260px;overflow:auto;margin-top:6px">${lista(n.novos, e => `<div>➕ <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.para)} <span class="muted">(item OS ${e.isoi})</span> <button class="btn s w" data-ocultar="${e.isoi}" title="tirar da base (não volta mais)">não usar</button></div>`)}${lista(n.precos, e => `<div>💲 <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.de)} → <b>${R4(e.para)}</b></div>`)}${lista(n.ligados, e => `<div>🔗 <b>${esc(e.aba)}</b>: ${esc(e.serv)} ligado ao item OS ${e.isoi}</div>`)}</div>${n.conferir.length ? `<div style="margin-top:8px"><b style="color:#9C5700">⚠ Valor da base diferente do plane (preço × quantidade não bate) — pode ser preço diferente ou o item ligado à OS errada:</b> <button class="btn s" data-act="usartodos">usar o preço do plane em todos</button>
+      <div style="max-height:260px;overflow:auto;margin-top:4px">${n.conferir.map(e => `<div style="padding:3px 0;border-bottom:1px dotted #c9d3e3">${esc(e.aba)}: <b>${esc(e.serv.slice(0, 90))}</b> <span class="muted">(item OS ${e.isoi})</span><br>
+        base ${R4(e.de)} × ${Q(e.qb)} = <b>${R$(e.de * e.qb)}</b> · plane ${R4(e.para)} × ${Q(e.qp)} = <b>${R$(e.para * e.qp)}</b> <button class="btn s w" data-usarpreco="${e.id}">usar o preço do plane</button></div>`).join('')}</div></div>` : ''}`}
   </div>`;
 }
 // medições do plane do empreiteiro no período; tipo 'P' = as que têm PREVISTA no título
@@ -505,7 +547,7 @@ function vResumo() {
       <td class="c">${dif == null ? '' : Math.abs(dif) < 0.01 ? '<span class="tag ok">igual</span>' : `<span class="tag bad">${R$(dif)}</span>`}</td>
       <td class="c"><button class="btn s w" data-goto="conferir" data-aba="${esc(a.nome)}">conferir</button></td></tr>`;
   }).filter(Boolean);
-  const av = AVISO ? `<div class="box" style="background:#E2EFDA;border-color:#A9D08E">✔ Ajuste aplicado nesta versão: <b>${esc(AVISO)}</b>. As linhas que não entraram no plane ficaram guardadas (não somam) no fim da tela Lançar.</div>` : '';
+  const av = AVISO ? `<div class="box" style="background:#E2EFDA;border-color:#A9D08E;position:relative"><button class="btn x" data-fechar="aviso" title="fechar" style="position:absolute;right:6px;top:2px;color:#375623;font-size:16px">✕</button>✔ Ajuste aplicado nesta versão: <b>${esc(AVISO)}</b>. As linhas que não entraram no plane ficaram guardadas (não somam) no fim da tela Lançar.</div>` : '';
   return av + boxNovidades(true) + `<h2>Resumo da medição de ${br(per)} <span class="muted">(${br(iniDe(per))} a ${br(per)})</span></h2>
   <div class="cards"><div class="card"><div class="l">Bruto executado</div><div class="v">${R$(tb)}</div></div>
   <div class="card"><div class="l">(–) Retenções</div><div class="v">${R$(tr)}</div></div><div class="card"><div class="l">(–) Descontos</div><div class="v">${R$(td)}</div></div>
@@ -695,6 +737,8 @@ function vConferir() {
   const lan = pm.length > 0;
   const plQ = {}; pm.forEach(m => m.it.forEach(i => { plQ[i.isoi] = (plQ[i.isoi] || 0) + i.q; }));
   const myQ = {}; ls.forEach(x => { const is = x.it && x.it.isoi; if (is) myQ[is] = (myQ[is] || 0) + x.qt; });
+  const plV = {}; pm.forEach(m => m.it.forEach(i => { plV[i.isoi] = (plV[i.isoi] || 0) + i.q * i.p; }));
+  const myV = {}; ls.forEach(x => { const is = x.it && x.it.isoi; if (is) myV[is] = (myV[is] || 0) + x.valor; });
   const t = totais(ABA, per); const pb = pm.reduce((s, m) => s + m.bruto, 0);
   const rows = ls.map((x, i) => {
     const is = x.it && x.it.isoi; const pi = is ? PL.itens[is] : null;
@@ -703,10 +747,15 @@ function vConferir() {
     else if (!is) conf = '<span class="tag bad">⚠ item sem vínculo com a OS</span>';
     else if (!PL.ok) conf = '<span class="tag mut">plane não lido</span>';
     else if (!lan) conf = '<span class="tag info">A LANÇAR</span>';
-    else conf = Math.abs((plQ[is] || 0) - myQ[is]) < 0.0005 ? '<span class="tag ok">✔ IGUAL</span>' : `<span class="tag bad">✖ DIFERENTE (plane: ${Q(plQ[is] || 0)})</span>`;
-    const aviso = pi && Math.abs(pi.preco - (x.preco || 0)) > 0.00005 ? `<span class="tag warn">preço OS ${R4(pi.preco)}</span>` : '';
-    return `<tr><td class="c">${i + 1}</td><td>${esc(x.l.serv)}</td><td>${esc(x.l.local)}</td><td class="n"><b>${Q(x.qt)}</b></td><td class="n">${R4(x.preco)}</td><td class="n">${R$(x.valor)}</td>
-      <td class="c">${is || '—'}</td><td>${pi ? esc(pi.item) : (is && PL.ok ? '<span class="tag warn">não achado nas OS</span>' : '')}</td><td class="n">${pi ? R4(pi.preco) : ''}</td><td class="n">${is && lan ? Q(plQ[is] || 0) : ''}</td><td class="c">${conf} ${aviso}</td></tr>`;
+    else conf = Math.abs((plV[is] || 0) - myV[is]) < 0.015 ? '<span class="tag ok">✔ IGUAL</span>' : `<span class="tag bad">✖ DIFERENTE (plane: ${R$(plV[is] || 0)})</span>`;
+    // quantidade a digitar no plane, na unidade/preço da OS (ex.: diária R$ 3.000 = 0,05 × R$ 60.000)
+    const qPlane = pi && pi.preco ? (Math.abs(pi.preco - (x.preco || 0)) > 0.00005 ? x.valor / pi.preco : x.qt) : null;
+    const conv = pi && qPlane != null && Math.abs(qPlane - x.qt) > 0.00005;
+    const aviso = pi && conv && !equivalente(x.it, pi) ? `<span class="tag warn">preço OS ${R4(pi.preco)}</span>` : '';
+    return `<tr><td class="c">${i + 1}</td><td>${esc(x.l.serv)}</td><td>${esc(x.l.local)}</td><td class="n">${Q(x.qt)}</td><td class="n">${R4(x.preco)}</td><td class="n">${R$(x.valor)}</td>
+      <td class="c">${is || '—'}</td><td>${pi ? esc(pi.item) : (is && PL.ok ? '<span class="tag warn">não achado nas OS</span>' : '')}</td><td class="n">${pi ? R4(pi.preco) : ''}</td>
+      <td class="n" style="background:#FFF2CC"><b>${qPlane == null ? '' : Q(Math.round(qPlane * 10000) / 10000)}</b>${conv ? '<br><span class="muted">(convertido p/ o preço da OS)</span>' : ''}</td>
+      <td class="n">${is && lan ? Q(plQ[is] || 0) : ''}</td><td class="c">${conf} ${aviso}</td></tr>`;
   }).join('');
   const soPlane = []; pm.forEach(m => m.it.forEach(i => { soPlane.push(Object.assign({ med: m.id }, i)); }));
   return `<h2>Conferir / lançar no plane — ${esc(a.titulo)}</h2>
@@ -715,8 +764,8 @@ function vConferir() {
    <div class="card"><div class="l">Bruto aqui</div><div class="v">${R$(t.bruto)}</div></div><div class="card"><div class="l">Bruto no plane</div><div class="v">${lan ? R$(pb) : '—'}</div></div>
    <div class="card ${lan && Math.abs(t.bruto - pb) > 0.01 ? 'rd' : 'gr'}"><div class="l">Diferença</div><div class="v">${lan ? R$(t.bruto - pb) : '—'}</div></div>
    <div class="card"><div class="l">A pagar no plane</div><div class="v">${lan ? R$(pm.reduce((s, m) => s + m.liq - m.ded, 0)) : '—'}</div></div></div>
-  <div class="box muted">Para lançar: no plane, em cada linha escolha o item da OS da coluna <b>"Serviço no plane"</b> e digite a <b>Qtd total</b>. Depois de salvar lá, clique em "Ler o plane de novo" e confira a última coluna.</div>
-  <table class="t"><thead><tr><th>#</th><th>Serviço (aqui)</th><th>Local</th><th>Qtd total</th><th>Preço</th><th>Valor</th><th>ID item OS</th><th>Serviço no plane (escolher este)</th><th>Preço OS</th><th>Qtd no plane</th><th>Conferência</th></tr></thead><tbody>${rows || '<tr><td colspan="11" class="c">Nenhuma linha executada neste período.</td></tr>'}</tbody></table>
+  <div class="box muted">Para lançar: no plane, em cada linha escolha o item da OS da coluna <b>"Serviço no plane"</b> e digite a <b>"Qtd para digitar no plane"</b> (coluna amarela — já convertida quando o preço da OS é diferente, ex.: diária R$ 3.000 = 0,05 de R$ 60.000). A conferência compara o valor em R$. Depois de salvar lá, clique em "Ler o plane de novo" e confira a última coluna.</div>
+  <table class="t"><thead><tr><th>#</th><th>Serviço (aqui)</th><th>Local</th><th>Qtd total (aqui)</th><th>Preço</th><th>Valor</th><th>ID item OS</th><th>Serviço no plane (escolher este)</th><th>Preço OS</th><th>Qtd para digitar no plane</th><th>Qtd já no plane</th><th>Conferência</th></tr></thead><tbody>${rows || '<tr><td colspan="12" class="c">Nenhuma linha executada neste período.</td></tr>'}</tbody></table>
   ${lan ? `<div class="sec">O QUE JÁ ESTÁ NO PLANE NESTA MEDIÇÃO</div><table class="t"><thead><tr><th>Medição</th><th>ID item OS</th><th>Serviço no plane</th><th>Qtd</th><th>Preço</th><th>Valor</th><th>Está aqui?</th></tr></thead><tbody>${soPlane.map(i => `<tr><td class="c">${i.med}</td><td class="c">${i.isoi}</td><td>${esc(i.desc)}</td><td class="n">${Q(i.q)}</td><td class="n">${R4(i.p)}</td><td class="n">${R$(i.q * i.p)}</td><td class="c">${myQ[i.isoi] != null ? '<span class="tag ok">✔ sim</span>' : '<span class="tag bad">✖ falta aqui</span>'}</td></tr>`).join('')}</tbody></table>` : ''}`;
 }
 
@@ -735,7 +784,7 @@ function vContrato() {
     if (!b.isoi) st = '<span class="tag bad">SEM ITEM NA OS</span>';
     else if (!PL.ok) st = '<span class="tag mut">plane não lido</span>';
     else if (!pi) st = '<span class="tag warn">não achado no plane</span>';
-    else if (Math.abs(pi.preco - (b.preco || 0)) > 0.00005) st = '<span class="tag warn">PREÇO DIFERENTE</span>';
+    else if (Math.abs(pi.preco - (b.preco || 0)) > 0.00005 && !equivalente(b, pi)) st = '<span class="tag warn">VALOR DIFERENTE</span>';
     else if (saldo < -0.0001) st = '<span class="tag warn">MEDIDO > QTD DA OS</span>';
     else st = '<span class="tag ok">OK</span>';
     return `<tr style="${e ? 'background:#EAF3FB' : ''}"><td class="c">${b.nAba || ''}</td><td>${esc(b.serv)}</td><td class="c">${esc(b.un)}</td><td class="n">${R4(b.preco)}</td><td class="c">${b.isoi || ''}</td><td class="n">${pi ? R4(pi.preco) : ''}</td><td class="n">${pi ? Q(pi.qtd) : ''}</td><td class="n">${pi ? Q(pi.medido) : ''}</td><td class="n">${e ? Q(e) : ''}</td><td class="n">${saldo == null ? '' : Q(saldo)}</td><td class="n">${pi && pi.qtd ? pct((pi.medido + (lan ? 0 : e)) / pi.qtd) : ''}</td><td class="c">${st}</td></tr>`;
@@ -753,10 +802,10 @@ function vBase() {
   const rows = lista.slice(0, 400).map(b => {
     const pi = b.isoi ? PL.itens[b.isoi] : null;
     const st0 = b.doPlane ? '<span class="tag info">NOVO DO PLANE</span> ' : '';
-    const st = st0 + (!b.isoi ? '<span class="tag bad">NÃO ESTÁ NA OS</span>' : !PL.ok ? '' : !pi ? '<span class="tag warn">não achado</span>' : Math.abs(pi.preco - (b.preco || 0)) > 0.00005 ? '<span class="tag warn">PREÇO DIFERENTE</span>' : b.vinc === 'conferir' ? '<span class="tag warn">CONFERIR NOME</span>' : '<span class="tag ok">OK</span>');
+    const st = st0 + (!b.isoi ? '<span class="tag bad">NÃO ESTÁ NA OS</span>' : !PL.ok ? '' : !pi ? '<span class="tag warn">não achado</span>' : Math.abs(pi.preco - (b.preco || 0)) > 0.00005 ? (equivalente(b, pi) ? `<span class="tag ok" title="mesmo valor: base ${R4(b.preco)} × ${Q(b.qref || 1)} = OS ${R4(pi.preco)} × ${Q(pi.qtd)}">OK (equivalente)</span>` : '<span class="tag warn">VALOR DIFERENTE</span>') : b.vinc === 'conferir' ? '<span class="tag warn">CONFERIR NOME</span>' : '<span class="tag ok">OK</span>');
     return `<tr data-bid="${b.id}"><td class="c">${b.n || ''}</td><td>${esc(b.aba)}</td><td class="c">${b.nAba || ''}</td><td style="min-width:300px"><input data-b="serv" value="${esc(b.serv)}"></td><td style="width:60px"><input data-b="un" value="${esc(b.un)}"></td>
      <td style="width:100px"><input class="num" data-b="preco" value="${b.preco == null ? '' : NF4.format(b.preco)}"></td><td style="width:80px"><input class="num" data-b="qref" value="${b.qref == null ? '' : Q(b.qref)}"></td>
-     <td style="width:80px"><input class="num" data-b="isoi" value="${b.isoi || ''}"></td><td>${pi ? esc(pi.item) : ''}</td><td class="n">${pi ? R4(pi.preco) : ''}</td><td class="c">${st}</td></tr>`;
+     <td style="width:80px"><input class="num" data-b="isoi" value="${b.isoi || ''}"></td><td>${pi ? esc(pi.item) : ''}</td><td class="n">${pi ? R4(pi.preco) + '<br><span class="muted">× ' + Q(pi.qtd) + '</span>' : ''}</td><td class="c">${st}</td></tr>`;
   }).join('');
   const ult = (S.logBase || []).slice(-40).reverse();
   return `<h2>Base de preços</h2>${boxNovidades(false)}
@@ -892,7 +941,7 @@ function novaLinha(tipo) {
   const inp = $(`tr[data-id="${l.id}"] input[data-f="serv"]`); if (inp) inp.focus();
 }
 function onClick(e) {
-  const t = e.target.closest('[data-view],[data-goto],[data-add],[data-del],[data-dup],[data-pick],[data-print],[data-act],[data-irper],[data-reat],[data-ocultar],[data-criaemp],[data-usarpreco]');
+  const t = e.target.closest('[data-view],[data-goto],[data-add],[data-del],[data-dup],[data-pick],[data-print],[data-act],[data-irper],[data-reat],[data-ocultar],[data-criaemp],[data-usarpreco],[data-fechar]');
   if (!t) return;
   const d = t.dataset;
   if (d.view) { VIEW = d.view; render(); return; }
@@ -901,6 +950,7 @@ function onClick(e) {
   if (d.del) { const l = S.lanc.find(x => x.id === d.del); if (l && confirm('Apagar a linha "' + (l.serv || '') + '"?')) { S.lanc = S.lanc.filter(x => x.id !== d.del); salvar(); render(); } return; }
   if (d.dup) { const l = S.lanc.find(x => x.id === d.dup); if (l) { const c = Object.assign({}, l, { id: uid(), ord: (l.ord || 0) + 0.5, fonte: 'medprime' }); S.lanc.push(c); salvar(); render(); } return; }
   if (d.pick) { abrirPicker(d.pick); return; }
+  if (d.fechar) { if (d.fechar === 'aviso') AVISO = ''; else { S.avisoFechado = d.fechar; salvar(); } render(); return; }
   if (d.usarpreco || d.act === 'usartodos') {
     const alvo = d.usarpreco ? NOVIDADES.conferir.filter(e => String(e.id) === d.usarpreco) : NOVIDADES.conferir.slice();
     if (d.act === 'usartodos' && !confirm(`Trocar ${alvo.length} preço(s) da base pelo preço do plane? As medições de meses anteriores ficam com o preço antigo.`)) return;
