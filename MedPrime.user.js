@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.4.0
+// @version      1.5.0
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @run-at       document-idle
@@ -15,7 +15,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.4.0';
+const VERSAO = '1.5.0';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 const API = 'https://plane.devstroupe.com/backend/';
 const KEY = 'medprime_estado_v1';
@@ -316,7 +316,7 @@ function aplicarPreco(b, novo, agora, nov) {
 }
 function sincronizarBase() {
   S.logBase = S.logBase || []; S.ocultosPlane = S.ocultosPlane || [];
-  const agora = new Date().toISOString(); const nov = { novos: [], precos: [], ligados: [], conferir: [], semAba: {} };
+  const agora = new Date().toISOString(); const nov = { id: Date.now(), novos: [], precos: [], ligados: [], conferir: [], semAba: {} };
   const ligados = new Set(S.base.filter(b => b.isoi).map(b => Number(b.isoi)));
   // 1) preços: quando o preço MUDA no plane, a base acompanha sozinha.
   //    Diferenças antigas (de antes do MedPrime ler o plane pela 1ª vez) ficam para você confirmar com um clique.
@@ -387,20 +387,36 @@ function sincronizarBase() {
   if (nov.novos.length || nov.precos.length || nov.ligados.length || nov.duplicados) salvar();
   NOVIDADES = nov;
 }
+let LEIT_FECHADA = null;
+// aviso de CADA leitura do plane: diz o que mudou nesta atualização (ou que não mudou nada)
+function boxLeitura(cheio) {
+  const n = NOVIDADES; if (!n || LEIT_FECHADA === n.id) return '';
+  const hora = PL.em ? PL.em.toLocaleTimeString('pt-BR').slice(0, 5) : '';
+  const x = `<button class="btn x" data-fechar="leit" title="fechar" style="position:absolute;right:6px;top:2px;font-size:16px;color:#7F6000">✕</button>`;
+  if (!n.novos.length && !n.precos.length && !n.ligados.length)
+    return `<div class="box" style="background:#E2EFDA;border-color:#A9D08E;position:relative">${x}✔ <b>Plane atualizado às ${hora}</b> — nenhum serviço novo e nenhum preço mudou nas OS desde a última leitura.</div>`;
+  const porAba = {}; n.novos.forEach(e => (porAba[e.aba] = porAba[e.aba] || []).push(e));
+  const abas = Object.keys(porAba).sort((a, b) => a.localeCompare(b, 'pt-BR'));
+  const novos = abas.map(a => `<div style="margin:3px 0 0 10px">➕ <b>${esc(a)}</b> (${porAba[a].length}): ${porAba[a].slice(0, cheio ? 999 : 6).map(e => `${esc(e.serv)} <span class="muted">${R4(e.para)}</span>${cheio ? ` <button class="btn s w" data-ocultar="${e.isoi}" title="tirar da base (não volta mais)">não usar</button>` : ''}`).join(cheio ? '<br>' : '; ')}${!cheio && porAba[a].length > 6 ? ` <span class="muted">… e mais ${porAba[a].length - 6}</span>` : ''}</div>`).join('');
+  const precos = n.precos.slice(0, cheio ? 999 : 10).map(e => `<div style="margin:3px 0 0 10px">💲 <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.de)} → <b>${R4(e.para)}</b></div>`).join('') + (!cheio && n.precos.length > 10 ? `<div style="margin-left:10px" class="muted">… e mais ${n.precos.length - 10}</div>` : '');
+  const lig = n.ligados.length ? `<div style="margin:3px 0 0 10px">🔗 ${n.ligados.length} item(ns) da base ligado(s) automaticamente à OS${cheio ? ': ' + n.ligados.map(e => `${esc(e.aba)} — ${esc(e.serv)}`).join('; ') : ''}</div>` : '';
+  return `<div class="box" style="background:#FFF2CC;border-color:#F4B183;position:relative">${x}<b style="font-size:14px">🔔 Plane atualizado às ${hora} — ${n.novos.length ? `${n.novos.length} serviço(s) novo(s) em ${abas.length} empreiteiro(s)` : 'sem serviço novo'}${n.precos.length ? ` · ${n.precos.length} preço(s) mudado(s)` : ''}</b>${n.duplicados ? ` <span class="muted">(${n.duplicados} duplicado(s) removido(s))</span>` : ''}
+    <div style="max-height:${cheio ? 320 : 220}px;overflow:auto">${novos}${precos}${lig}</div>
+    ${n.novos.length ? `<div class="muted" style="margin-top:4px">Os serviços novos já entraram na Base de preços e já aparecem para lançar.${cheio ? '' : ' <span class="link" data-goto="base">ver na Base de preços</span>'}</div>` : ''}</div>`;
+}
+// pendências que continuam até você resolver: valores diferentes do plane e fornecedores sem empreiteiro
 function boxNovidades(curto) {
   const n = NOVIDADES; if (!n) return '';
   const sa = Object.keys(n.semAba);
-  if (!n.novos.length && !n.precos.length && !n.ligados.length && !n.conferir.length && !sa.length) return '';
-  const lista = (arr, f) => arr.slice(0, curto ? 0 : 60).map(f).join('');
-  const sig = [n.novos.length, n.precos.length, n.ligados.length, n.conferir.length, sa.length, (S.logBase || []).length].join('|');
+  if (!n.conferir.length && !sa.length) return '';
+  const sig = 'p|' + n.conferir.map(e => e.id).join(',') + '|' + sa.join(',');
   if (S.avisoFechado === sig) return '';
-  return `<div class="box" style="background:#EAF3FB;border-color:#9DC3E6;position:relative"><button class="btn x" data-fechar="${sig}" title="fechar este aviso" style="position:absolute;right:6px;top:2px;color:#1F3864;font-size:16px">✕</button><b>🔄 Base de preços atualizada pelo plane</b> (${PL.em ? PL.em.toLocaleTimeString('pt-BR').slice(0, 5) : ''}):
-    ${n.novos.length} serviço(s) novo(s) das OS · ${n.precos.length} preço(s) atualizado(s) · ${n.ligados.length} item(ns) da base ligado(s) à OS${n.duplicados ? ` · ${n.duplicados} duplicado(s) da versão anterior removido(s)` : ''}${n.conferir.length ? ` · <span style="color:#9C5700">${n.conferir.length} preço(s) da base diferente(s) do plane para você confirmar</span>` : ''}
-    ${curto ? ' — <span class="link" data-goto="base">ver detalhes na Base de preços</span>' : ''}
+  return `<div class="box" style="background:#EAF3FB;border-color:#9DC3E6;position:relative"><button class="btn x" data-fechar="${sig}" title="fechar este aviso" style="position:absolute;right:6px;top:2px;color:#1F3864;font-size:16px">✕</button><b>📋 Pendências da base de preços</b>${n.conferir.length ? ` · <span style="color:#9C5700">${n.conferir.length} valor(es) da base diferente(s) do plane para você confirmar</span>` : ''}
+    ${curto && n.conferir.length ? ' — <span class="link" data-goto="base">ver na Base de preços</span>' : ''}
     ${sa.length ? `<br><span style="color:#9C0006">Fornecedor(es) com OS no plane e sem empreiteiro aqui: ${sa.map(k => `<b>${esc(n.semAba[k].nome)}</b> (${n.semAba[k].n} itens) <button class="btn s w" data-criaemp="${k}">criar empreiteiro</button>`).join(' ')}</span>` : ''}
-    ${curto ? '' : `<div style="max-height:260px;overflow:auto;margin-top:6px">${lista(n.novos, e => `<div>➕ <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.para)} <span class="muted">(item OS ${e.isoi})</span> <button class="btn s w" data-ocultar="${e.isoi}" title="tirar da base (não volta mais)">não usar</button></div>`)}${lista(n.precos, e => `<div>💲 <b>${esc(e.aba)}</b>: ${esc(e.serv)} — ${R4(e.de)} → <b>${R4(e.para)}</b></div>`)}${lista(n.ligados, e => `<div>🔗 <b>${esc(e.aba)}</b>: ${esc(e.serv)} ligado ao item OS ${e.isoi}</div>`)}</div>${n.conferir.length ? `<div style="margin-top:8px"><b style="color:#9C5700">⚠ Valor da base diferente do plane (preço × quantidade não bate) — pode ser preço diferente ou o item ligado à OS errada:</b> <button class="btn s" data-act="usartodos">usar o preço do plane em todos</button>
+    ${!curto && n.conferir.length ? `<div style="margin-top:8px"><b style="color:#9C5700">⚠ Valor da base diferente do plane (preço × quantidade não bate) — pode ser preço diferente ou o item ligado à OS errada:</b> <button class="btn s" data-act="usartodos">usar o preço do plane em todos</button>
       <div style="max-height:260px;overflow:auto;margin-top:4px">${n.conferir.map(e => `<div style="padding:3px 0;border-bottom:1px dotted #c9d3e3">${esc(e.aba)}: <b>${esc(e.serv.slice(0, 90))}</b> <span class="muted">(item OS ${e.isoi})</span><br>
-        base ${R4(e.de)} × ${Q(e.qb)} = <b>${R$(e.de * e.qb)}</b> · plane ${R4(e.para)} × ${Q(e.qp)} = <b>${R$(e.para * e.qp)}</b> <button class="btn s w" data-usarpreco="${e.id}">usar o preço do plane</button></div>`).join('')}</div></div>` : ''}`}
+        base ${R4(e.de)} × ${Q(e.qb)} = <b>${R$(e.de * e.qb)}</b> · plane ${R4(e.para)} × ${Q(e.qp)} = <b>${R$(e.para * e.qp)}</b> <button class="btn s w" data-usarpreco="${e.id}">usar o preço do plane</button></div>`).join('')}</div></div>` : ''}
   </div>`;
 }
 // medições do plane do empreiteiro no período; tipo 'P' = as que têm PREVISTA no título
@@ -508,6 +524,7 @@ function render() {
     f.onchange = () => { const fl = f.files[0]; if (!fl) return; const rd = new FileReader(); rd.onload = () => { try { abrirArquivo(JSON.parse(rd.result)); } catch (er) { alert('Não consegui abrir: ' + er.message); } f.value = ''; }; rd.readAsText(fl); }; }
   const lg = $('#lgTop'); if (lg) { const u = LOGO(1); if (u) { lg.src = u; lg.style.display = ''; } }
   if (!S) { $('#nav').innerHTML = ''; $('#selPer').innerHTML = ''; $('#cnt').innerHTML = vInicio(); return; }
+  if (S.abas) S.abas.sort((a, b) => String(a.nome).localeCompare(String(b.nome), 'pt-BR'));
   if (!S.mapa) VIEW = 'config';
   const per = S.dataMed;
   const ps = []; for (let k = -12; k <= 3; k++) ps.push(addMes(per, k));
@@ -517,7 +534,7 @@ function render() {
   status();
   const f = { resumo: vResumo, lancar: vLancar, boletim: vBoletim, croqui: vCroqui, conferir: vConferir, contrato: vContrato, base: vBase, plane: vPlane, config: vConfig }[VIEW];
   const sc = $('#cnt').scrollTop;
-  $('#cnt').innerHTML = f();
+  $('#cnt').innerHTML = (VIEW === 'config' ? '' : boxLeitura(VIEW === 'base')) + f();
   if (VIEW === 'lancar' || VIEW === 'base') $('#cnt').scrollTop = sc;
 }
 function selAba(id) {
@@ -708,12 +725,17 @@ function vDoc(kind) {
   ${kind === 'c' ? `<label>Serviço</label><select data-act="svc" style="max-width:360px"><option value="TODOS">TODOS OS SERVIÇOS</option>${svcs.map(s => `<option value="${esc(s)}" ${s === SVC ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>` : ''}
   <span style="flex:1"></span><button class="btn g" data-print="${kind}">🖨️ Imprimir / Salvar PDF</button>${kind === 'c' ? '<button class="btn w" data-print="c1">PDF de cada serviço</button>' : '<button class="btn w" data-print="bc">Boletim + croqui juntos</button>'}</div>
   <div class="prev" style="width:${kind === 'b' ? 1050 : 1120}px"><style>${DOC_CSS}</style>${kind === 'b' ? docBoletim(MODO) : docCroqui(MODO)}</div>
-  <p class="muted">No "Imprimir", escolha a impressora "Salvar como PDF". Nome sugerido do arquivo: MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${esc(ABA)} - ${kind === 'b' ? 'BOLETIM' : 'CROQUI'}${MODO === 'P' ? ' PREVISTA' : ''}.pdf</p>`;
+  <p class="muted">No "Imprimir", escolha a impressora "Salvar como PDF" — o arquivo já vem com o nome: <b>${esc(nomePdf(kind))}.pdf</b>${kind === 'b' ? ` (boletim + croqui juntos: <b>${esc(nomePdf('bc'))}.pdf</b>)` : ''}</p>`;
 }
 const vBoletim = () => vDoc('b'), vCroqui = () => vDoc('c');
+function nomePdf(kind) {
+  const tipo = { b: 'BOLETIM', c: 'CROQUI', bc: 'CROQUI E BOLETIM', c1: 'CROQUI POR SERVIÇO' }[kind] || 'BOLETIM';
+  const svc = kind === 'c' && SVC !== 'TODOS' ? ' - ' + SVC : '';
+  return `MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${ABA} - ${tipo}${svc}${MODO === 'P' ? ' PREVISTA' : ''}`.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 180);
+}
 function imprimir(kind) {
   let body = '', orient = 'landscape';
-  const nome = `MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${ABA}`;
+  const nome = nomePdf(kind);
   if (kind === 'b') { body = docBoletim(MODO); }
   else if (kind === 'c') { body = docCroqui(MODO); }
   else if (kind === 'bc') { body = docBoletim(MODO) + '<div style="page-break-before:always"></div>' + docCroqui(MODO); }
@@ -726,7 +748,10 @@ function imprimir(kind) {
   const dd = fr.contentDocument; dd.open();
   dd.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(nome)}</title><style>@page{size:A4 ${orient};margin:7mm}body{margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact}${DOC_CSS}</style></head><body>${body}</body></html>`);
   dd.close();
-  setTimeout(() => { fr.contentWindow.focus(); fr.contentWindow.print(); setTimeout(() => fr.remove(), 60000); }, 400);
+  // o Chrome sugere o nome do PDF pelo título da página: troca o título enquanto a janela de impressão está aberta e depois volta
+  const tituloAntes = document.title; let voltou = false;
+  const volta = () => { if (voltou) return; voltou = true; document.title = tituloAntes; };
+  setTimeout(() => { document.title = nome; fr.contentWindow.addEventListener('afterprint', () => setTimeout(volta, 500)); fr.contentWindow.focus(); fr.contentWindow.print(); setTimeout(volta, 120000); setTimeout(() => fr.remove(), 150000); }, 400);
 }
 
 // ---------------- CONFERIR / LANÇAR NO PLANE
@@ -950,7 +975,7 @@ function onClick(e) {
   if (d.del) { const l = S.lanc.find(x => x.id === d.del); if (l && confirm('Apagar a linha "' + (l.serv || '') + '"?')) { S.lanc = S.lanc.filter(x => x.id !== d.del); salvar(); render(); } return; }
   if (d.dup) { const l = S.lanc.find(x => x.id === d.dup); if (l) { const c = Object.assign({}, l, { id: uid(), ord: (l.ord || 0) + 0.5, fonte: 'medprime' }); S.lanc.push(c); salvar(); render(); } return; }
   if (d.pick) { abrirPicker(d.pick); return; }
-  if (d.fechar) { if (d.fechar === 'aviso') AVISO = ''; else { S.avisoFechado = d.fechar; salvar(); } render(); return; }
+  if (d.fechar) { if (d.fechar === 'leit') LEIT_FECHADA = NOVIDADES && NOVIDADES.id; else if (d.fechar === 'aviso') AVISO = ''; else { S.avisoFechado = d.fechar; salvar(); } render(); return; }
   if (d.usarpreco || d.act === 'usartodos') {
     const alvo = d.usarpreco ? NOVIDADES.conferir.filter(e => String(e.id) === d.usarpreco) : NOVIDADES.conferir.slice();
     if (d.act === 'usartodos' && !confirm(`Trocar ${alvo.length} preço(s) da base pelo preço do plane? As medições de meses anteriores ficam com o preço antigo.`)) return;
