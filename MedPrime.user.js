@@ -1,22 +1,44 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.5.0
+// @version      1.6.0
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
+// @match        https://gdol.sgq2.com.br/*
 // @run-at       document-idle
 // @noframes
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      reports-api.sgq2.com.br
+// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js
 // @updateURL    https://raw.githubusercontent.com/joaovitorferreirafi-blip/medprime/main/MedPrime.user.js
 // @downloadURL  https://raw.githubusercontent.com/joaovitorferreirafi-blip/medprime/main/MedPrime.user.js
 // ==/UserScript==
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.5.0';
+const VERSAO = '1.6.0';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+// ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
+if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
+  const copiaSGQ = () => {
+    try {
+      const ls = W.localStorage; const j = k => { try { return JSON.parse(ls.getItem(k) || 'null'); } catch (e) { return null; } };
+      const areas = j('obra-area-dropdown'), servs = j('obra-servico-dropdown');
+      const m = /[?&]id=(\d+)/.exec(location.search); const ant = (typeof GM_getValue === 'function' && GM_getValue('medprime_sgq', null)) || {};
+      const idObra = m && /Obra|obra/.test(location.pathname) ? +m[1] : ant.idObra || 2072;
+      if (!ls.getItem('idUsuario') || !Array.isArray(areas) || !Array.isArray(servs) || !servs.length) return;
+      const novo = { idObra, idUsuario: +ls.getItem('idUsuario'), empresa: ls.getItem('empresa') || 'REALIZA',
+        areas: areas.map(a => [a.idObraAreaChecklist, a.descricao]), servs: servs.map(x => [x.idChecklistServico, String(x.descricao).replace(/\s+/g, ' ').trim()]), em: new Date().toISOString() };
+      if (JSON.stringify([novo.idObra, novo.idUsuario, novo.areas, novo.servs]) !== JSON.stringify([ant.idObra, ant.idUsuario, ant.areas, ant.servs])) GM_setValue('medprime_sgq', novo);
+    } catch (e) { console.warn('MedPrime SGQ', e); }
+  };
+  setInterval(copiaSGQ, 5000); copiaSGQ();
+  return;
+}
 const API = 'https://plane.devstroupe.com/backend/';
 const KEY = 'medprime_estado_v1';
 const PAL = ['#FFC000', '#92D050', '#5B9BD5', '#F47E7E', '#B18CD6', '#FF9933', '#40C2C2', '#FF99CC', '#A6A6A6', '#C6E0B4', '#B4C6E7', '#CC9966'];
@@ -501,6 +523,7 @@ function abrir() {
   $('#selPer').onchange = e => { S.dataMed = e.target.value; salvar(); render(); };
   R.addEventListener('click', onClick);
   R.addEventListener('change', onChange);
+  R.addEventListener('toggle', e => { if (e.target && e.target.dataset && e.target.dataset.fvsbox) FVS_ABERTO = e.target.open; }, true);
   R.addEventListener('input', onInput);
   render();
   if (S && !PL.ok) carregarPlane();
@@ -716,6 +739,118 @@ const DOC_CSS = `
 .doc .areas2{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:4px}.doc .ar{border:1.5px solid #1F3864;text-align:center;font-weight:700;font-size:9px;padding:6px 2px}
 .doc .obs{border:1px solid #1F3864;min-height:40px;padding:4px 6px;font-size:9px;line-height:1.45}
 `;
+// ------------------------------------------------------------------ FVS do SGQ (relatório Monitoramento de Checklist)
+const SGQ_REL = 'https://reports-api.sgq2.com.br/reports/monitoramento-checklist';
+const sgq = () => { try { const v = GM_getValue('medprime_sgq', null); return v && v.servs && v.servs.length ? v : null; } catch (e) { return null; } };
+const PALAVRAS_FRACAS = new Set(['EMPREITADA', 'EXECUCAO', 'PARA', 'COM', 'DOS', 'DAS', 'POR', 'INCLUSO', 'PREDIO', 'REV', 'REV00', 'REV01', 'REV02', 'REV03', 'REV04', 'AMOSTRAGEM', 'NOVO', 'FVS', 'SERVICO', 'SERVICOS', 'MAO', 'OBRA', 'INSTALACAO', 'TODOS', 'BLOCO', 'APTO', 'APARTAMENTO', 'APARTAMENTOS', 'HALL', 'ETAPA', 'LOGISTICA', 'DIARIA', 'RETRABALHO', 'AJUSTE', 'SEM', 'COMPLETA', 'TIPOS', 'CANTO', 'MEIO', 'TERREO', 'NOS', 'NAS', 'QUE', 'ESTA', 'SERA', 'DEVIDO', 'FATO']);
+const SINONIMOS = [[/\bJANELAS?\b/g, 'ESQUADRIAS JANELAS'], [/\bPORTAS?\b/g, 'ESQUADRIAS PORTAS'], [/\bREJUNTAMENTO\b/g, 'REJUNTE'], [/\bCAIXAO PERDIDO\b/g, 'FIADA FALSA'],
+  [/\b(PISO|PAREDE) CERAMIC\w*/g, 'REVESTIMENTO CERAMICO'], [/\bCERAMIC\w*\b/g, 'CERAMICO'], [/\bPORCELANAT\w*/g, 'PORCELANATO REVESTIMENTO'], [/\bACARTONAD\w*/g, 'ACARTONADO'], [/\bDRYWALL\b/g, 'GESSO ACARTONADO']];
+const raiz = w => (w.length > 4 ? w.replace(/S$/, '') : w).slice(0, 6);
+const tokFvs = (s, ehServ) => { let t = semac(s).replace(/^\s*FVS\s+\d+\s*[A-Z]?\d*\s*-?/, ' ').replace(/\b\d+(\.\d+)*\b/g, ' ');
+  if (!ehServ) t = t.replace(/\(.*?\)/g, ' ');
+  if (ehServ) { SINONIMOS.forEach(([re, v]) => { t = t.replace(re, v); }); if (/\bGESSO\b/.test(t) && !/ACARTONADO|FORRO|SHAFT/.test(t)) t += ' CORRIDO'; if (/\bBALDRAME\b/.test(t)) t = t.replace(/\bVIGAS?\b/g, ' '); }
+  return Array.from(new Set(t.replace(/[^A-Z ]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !PALAVRAS_FRACAS.has(w)).map(raiz))); };
+// sugere a FVS pelo nome do serviço: a "família" da FVS (1ª palavra: IMPERMEABILIZAÇÃO, ESQUADRIAS, GESSO...) tem que aparecer no serviço
+function sugereFvs(serv) {
+  const g = sgq(); if (!g) return null;
+  const A = new Set(tokFvs(String(serv).replace(/^\s*\d+\s*-\s*/, ''), true)); if (!A.size) return null;
+  let best = null, bs = 0;
+  g.servs.forEach(([id, nome]) => { const B = tokFvs(nome); if (!B.length) return; let n = 0; B.forEach(w => { if (A.has(w)) n++; }); if (!n) return;
+    const sc = n / B.length * (A.has(B[0]) ? 1 : 0.5); if (sc >= bs) { bs = sc; best = id; } });
+  return bs >= 0.34 ? best : null;
+}
+const chaveFvs = (aba, serv) => aba + '|' + serv;
+function fvsDoServ(aba, serv, obs) {   // { ids:[...], salvo:true|false }
+  S.fvs = S.fvs || {};
+  const v = S.fvs[chaveFvs(aba, serv)];
+  if (v) return { ids: v.filter(x => x !== 0), salvo: true };
+  const sg = sugereFvs(serv); return { ids: sg ? [sg] : [], salvo: false };
+}
+const nomeFvs = id => { const g = sgq(); const x = g && g.servs.find(s => s[0] === +id); return x ? x[1] : 'FVS ' + id; };
+// locais medidos -> áreas do SGQ (BLOCO 01 - APTO 108, BLOCO 01 - 00 TÉRREO, BLOCO 01, - PORTARIA ...)
+function areasDoSGQ(linhasDoc) {
+  const g = sgq(); if (!g) return { ids: [], nomes: [] };
+  const porNome = {}; g.areas.forEach(([id, n]) => { porNome[semac(n).replace(/\s+/g, ' ').trim()] = id; });
+  const quer = new Set(); const p2 = n => String(n).padStart(2, '0');
+  linhasDoc.forEach(x => {
+    chavesDaLinha(x.l.local, x.l.obs, x.l.serv).chaves.forEach(k => {
+      const p = k.split('|');
+      if (p[0] === 'B') { const f = Math.floor(+p[2] / 100); quer.add(`BLOCO ${p2(p[1])}`); quer.add(`BLOCO ${p2(p[1])} - APTO ${p[2]}`); quer.add(`BLOCO ${p2(p[1])} - ${f === 1 ? '00 TERREO' : p2(f - 1) + 'º PAVIMENTO'}`); }
+      else if (p[0] === 'H') { const f = +p[3]; quer.add(`BLOCO ${p2(p[1])}`); quer.add(`BLOCO ${p2(p[1])} - ${f === 1 ? '00 TERREO' : p2(f - 1) + 'º PAVIMENTO'}`); }
+      else if (p[0] === 'A') { const kw = (mapaObj()[k] || {}).kw || p[1]; g.areas.forEach(([id, n]) => { if (!/^\s*BLOCO/i.test(n) && casa(semac(n), kw)) quer.add(semac(n).replace(/\s+/g, ' ').trim()); }); }
+    });
+  });
+  const ids = [], nomes = [];
+  quer.forEach(n => { const id = porNome[semac(n)]; if (id && ids.indexOf(id) < 0) { ids.push(id); nomes.push(n); } });
+  return { ids, nomes };
+}
+function gmPost(url, corpo, headers) {
+  return new Promise((ok, falha) => {
+    if (typeof GM_xmlhttpRequest !== 'function') { falha(new Error('o Tampermonkey não liberou o acesso ao SGQ (reinstale o script)')); return; }
+    GM_xmlhttpRequest({ method: 'POST', url, data: JSON.stringify(corpo), headers: Object.assign({ 'Content-Type': 'application/json' }, headers), timeout: 120000,
+      onload: r => { try { ok(JSON.parse(r.responseText)); } catch (e) { falha(new Error('resposta inválida do SGQ (' + r.status + ')')); } },
+      onerror: () => falha(new Error('sem conexão com o SGQ')), ontimeout: () => falha(new Error('o SGQ demorou demais para responder')) });
+  });
+}
+// pede o relatório ao SGQ (só gera relatório, não grava nada)
+async function relatorioFvs(fvsIds, areaIds, mime) {
+  const g = sgq(); if (!g) throw new Error('abra o SGQ uma vez (Checklist de Área da obra) para o MedPrime pegar a lista de FVS');
+  const corpo = { idObra: g.idObra, idUsuario: g.idUsuario, area: areaIds.length ? areaIds.join(',') : null, statusArea: null, servico: fvsIds.join(','), statusServico: null,
+    dataAberturaDe: null, dataAberturaAte: null, dataEncerramentoDe: null, dataEncerramentoAte: null, statusVerificacao: null, statusItemChecklist: null, empresaTercerizadas: null, funcionarios: null, requiredMimeType: mime };
+  const j = await gmPost(SGQ_REL, corpo, { BancoSchema: g.empresa, UsuarioIdSchema: String(g.idUsuario) });
+  const d = j && (j.data || j.Data); if (!j || j.status !== 'ok' || !d || !d.bytes) throw new Error('o SGQ não gerou o relatório' + (j && j.title ? ' (' + j.title + ')' : ''));
+  return d;
+}
+const b64bytes = b64 => { const s = atob(b64); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
+function contarFvs(htmlB64) {
+  const html = new TextDecoder('utf-8').decode(b64bytes(htmlB64));
+  const doc = new DOMParser().parseFromString(html.replace(/<script[\s\S]*?<\/script>/gi, ''), 'text/html');
+  return Array.from(doc.querySelectorAll('tr')).filter(tr => !tr.querySelector('tr')).map(tr => Array.from(tr.children).map(td => td.textContent.trim())).filter(c => c.length >= 15 && /FVS/.test(c[3] || '')).length;
+}
+function pedidoFvs() {
+  const d = dadosDoc(MODO); const ls = d.ls.filter(x => !ehDesconto(x.l));
+  const ids = []; ls.forEach(x => fvsDoServ(d.a.nome, x.l.serv, x.l.obs).ids.forEach(i => { if (ids.indexOf(i) < 0) ids.push(i); }));
+  return { d, ls, ids, ar: areasDoSGQ(ls) };
+}
+let FVS_MSG = '';
+async function gerarFvs(modo) {   // modo 'pdf' = baixa o PDF da FVS; 'junto' = devolve as páginas (imagens) para imprimir com boletim + croqui
+  const p = pedidoFvs();
+  if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
+  FVS_MSG = '⏳ Pedindo a FVS ao SGQ…'; render();
+  const n = contarFvs((await relatorioFvs(p.ids, p.ar.ids, 'text/html')).bytes);
+  if (!n) throw new Error('o SGQ não tem FVS desses serviços' + (p.ar.ids.length ? ' nesses locais' : '') + ': ' + p.ids.map(nomeFvs).join('; '));
+  const pdf = await relatorioFvs(p.ids, p.ar.ids, 'application/pdf');
+  FVS_MSG = `✔ ${n} FVS encontrada(s) no SGQ.`;
+  if (modo === 'pdf') { baixar(nomePdf('f') + '.pdf', b64bytes(pdf.bytes), 'application/pdf'); render(); return null; }
+  return { n, paginas: await pdfEmImagens(b64bytes(pdf.bytes)) };
+}
+async function pdfEmImagens(bytes) {
+  const lib = (typeof pdfjsLib !== 'undefined' && pdfjsLib) || globalThis.pdfjsLib || W.pdfjsLib;
+  if (!lib) throw new Error('o leitor de PDF não carregou — use o botão "FVS (PDF)" separado');
+  try { if (!lib.GlobalWorkerOptions.workerSrc) lib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch (e) {}
+  const pdf = await lib.getDocument({ data: bytes, isEvalSupported: false }).promise; const out = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const pg = await pdf.getPage(i); const vp = pg.getViewport({ scale: 2 });
+    const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
+    await pg.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+    out.push({ src: cv.toDataURL('image/jpeg', 0.92), paisagem: vp.width > vp.height });
+  }
+  return out;
+}
+function boxFvs() {
+  const g = sgq();
+  if (!g) return `<div class="box" style="background:#FFF2CC;border-color:#F4B183">📋 <b>FVS do SGQ:</b> para gerar a FVS junto com a medição, abra o <a href="https://gdol.sgq2.com.br" target="_blank" class="link">SGQ</a> (já logado) e entre na <b>Checklist de Área</b> da obra uma vez. O MedPrime copia a lista de FVS e de áreas sozinho; depois volte aqui.</div>`;
+  const p = pedidoFvs(); const servs = []; const vistos = new Set();
+  p.ls.forEach(x => { if (!vistos.has(x.l.serv)) { vistos.add(x.l.serv); servs.push(x.l); } });
+  if (!servs.length) return '';
+  const opts = (sel) => `<option value="">— escolher FVS —</option><option value="0" ${sel === 0 ? 'selected' : ''}>(este serviço não tem FVS)</option>` + g.servs.map(([id, n]) => `<option value="${id}" ${sel === id ? 'selected' : ''}>${esc(n)}</option>`).join('');
+  const linhasH = servs.map(l => { const f = fvsDoServ(p.d.a.nome, l.serv, l.obs); const salvo = (S.fvs || {})[chaveFvs(p.d.a.nome, l.serv)]; const sel = salvo ? salvo[0] : (f.ids[0] || null);
+    return `<tr><td>${esc(l.serv)}</td><td><select data-fvs="${esc(chaveFvs(p.d.a.nome, l.serv))}" style="max-width:520px">${opts(sel)}</select> ${salvo ? '' : f.ids.length ? '<span class="tag warn" title="sugestão pelo nome do serviço — escolha de novo para confirmar">sugerida</span>' : '<span class="tag warn">sem FVS</span>'}</td></tr>`; }).join('');
+  return `<details class="box" style="background:#F3F8EC;border-color:#A9D08E" ${FVS_ABERTO ? 'open' : ''} data-fvsbox="1"><summary style="cursor:pointer"><b>📋 FVS do SGQ</b> — ${p.ids.length} FVS ligada(s) aos serviços desta medição · ${p.ar.ids.length ? p.ar.ids.length + ' área(s) do SGQ pelos locais medidos' : 'sem filtro de local'} <span class="muted">(lista do SGQ de ${br((g.em || '').slice(0, 10))})</span>${FVS_MSG ? ` · <b>${esc(FVS_MSG)}</b>` : ''}</summary>
+    <table class="t" style="margin-top:6px"><thead><tr><th>Serviço medido</th><th>FVS no SGQ</th></tr></thead><tbody>${linhasH}</tbody></table>
+    <div class="muted" style="margin-top:4px">Traz todas as FVS do serviço (sem filtro de data), só nos blocos/aptos/áreas lançados nesta medição. A escolha fica salva para as próximas medições.</div></details>`;
+}
+let FVS_ABERTO = false;
 function vDoc(kind) {
   const ls = dadosDoc(MODO).ls;
   const svcs = Array.from(new Set(ls.filter(x => !ehDesconto(x.l)).map(x => x.l.serv)));
@@ -723,22 +858,27 @@ function vDoc(kind) {
   return `<h2>${kind === 'b' ? 'Boletim' : 'Croqui'} — ${esc(nomeAba(ABA || S.abas[0].nome))}</h2>
   <div class="bar">${selAba()}<label>Tipo</label><select data-act="modo"><option value="E" ${MODO === 'E' ? 'selected' : ''}>Medição executada</option><option value="P" ${MODO === 'P' ? 'selected' : ''}>Medição prevista</option></select>
   ${kind === 'c' ? `<label>Serviço</label><select data-act="svc" style="max-width:360px"><option value="TODOS">TODOS OS SERVIÇOS</option>${svcs.map(s => `<option value="${esc(s)}" ${s === SVC ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>` : ''}
-  <span style="flex:1"></span><button class="btn g" data-print="${kind}">🖨️ Imprimir / Salvar PDF</button>${kind === 'c' ? '<button class="btn w" data-print="c1">PDF de cada serviço</button>' : '<button class="btn w" data-print="bc">Boletim + croqui juntos</button>'}</div>
+  <span style="flex:1"></span><button class="btn g" data-print="${kind}">🖨️ Imprimir / Salvar PDF</button>${kind === 'c' ? '<button class="btn w" data-print="c1">PDF de cada serviço</button>' : '<button class="btn w" data-print="bc">Boletim + croqui juntos</button><button class="btn w" data-print="f" title="baixa o relatório Monitoramento de Checklist do SGQ">📋 FVS (PDF)</button><button class="btn w" data-print="bcf">Boletim + croqui + FVS</button>'}</div>
+  ${kind === 'b' && MODO === 'E' ? boxFvs() : ''}
   <div class="prev" style="width:${kind === 'b' ? 1050 : 1120}px"><style>${DOC_CSS}</style>${kind === 'b' ? docBoletim(MODO) : docCroqui(MODO)}</div>
-  <p class="muted">No "Imprimir", escolha a impressora "Salvar como PDF" — o arquivo já vem com o nome: <b>${esc(nomePdf(kind))}.pdf</b>${kind === 'b' ? ` (boletim + croqui juntos: <b>${esc(nomePdf('bc'))}.pdf</b>)` : ''}</p>`;
+  <p class="muted">No "Imprimir", escolha a impressora "Salvar como PDF" — o arquivo já vem com o nome: <b>${esc(nomePdf(kind))}.pdf</b>${kind === 'b' ? ` (boletim + croqui juntos: <b>${esc(nomePdf('bc'))}.pdf</b> · FVS: <b>${esc(nomePdf('f'))}.pdf</b> · tudo junto: <b>${esc(nomePdf('bcf'))}.pdf</b>)` : ''}</p>`;
 }
 const vBoletim = () => vDoc('b'), vCroqui = () => vDoc('c');
 function nomePdf(kind) {
-  const tipo = { b: 'BOLETIM', c: 'CROQUI', bc: 'CROQUI E BOLETIM', c1: 'CROQUI POR SERVIÇO' }[kind] || 'BOLETIM';
+  const tipo = { b: 'BOLETIM', c: 'CROQUI', bc: 'CROQUI E BOLETIM', c1: 'CROQUI POR SERVIÇO', f: 'FVS', bcf: 'CROQUI, BOLETIM E FVS' }[kind] || 'BOLETIM';
   const svc = kind === 'c' && SVC !== 'TODOS' ? ' - ' + SVC : '';
   return `MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${ABA} - ${tipo}${svc}${MODO === 'P' ? ' PREVISTA' : ''}`.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 180);
 }
-function imprimir(kind) {
+async function imprimir(kind) {
+  if (kind === 'f') { try { await gerarFvs('pdf'); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); alert('FVS: ' + e.message); } return; }
+  let fvsPags = null;
+  if (kind === 'bcf') { try { fvsPags = (await gerarFvs('junto')).paginas; render(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); if (!confirm('FVS: ' + e.message + '\n\nImprimir só o boletim + croqui?')) return; kind = 'bc'; } }
   let body = '', orient = 'landscape';
   const nome = nomePdf(kind);
   if (kind === 'b') { body = docBoletim(MODO); }
   else if (kind === 'c') { body = docCroqui(MODO); }
-  else if (kind === 'bc') { body = docBoletim(MODO) + '<div style="page-break-before:always"></div>' + docCroqui(MODO); }
+  else if (kind === 'bc' || kind === 'bcf') { body = docBoletim(MODO) + '<div style="page-break-before:always"></div>' + docCroqui(MODO);
+    if (fvsPags) body += fvsPags.map(pg => `<div style="page-break-before:always;width:100%;height:${pg.paisagem ? 190 : 270}mm;display:flex;align-items:center;justify-content:center"><img src="${pg.src}" style="max-width:100%;max-height:100%"></div>`).join(''); }
   else if (kind === 'c1') {
     const keep = SVC; const svcs = Array.from(new Set(dadosDoc(MODO).ls.filter(x => !ehDesconto(x.l)).map(x => x.l.serv)));
     body = svcs.map((s, i) => { SVC = s; return (i ? '<div style="page-break-before:always"></div>' : '') + docCroqui(MODO); }).join(''); SVC = keep;
@@ -1027,6 +1167,7 @@ function onClick(e) {
 }
 function onChange(e) {
   const t = e.target; const d = t.dataset;
+  if (d.fvs) { S.fvs = S.fvs || {}; if (t.value === '') delete S.fvs[d.fvs]; else S.fvs[d.fvs] = [+t.value]; FVS_ABERTO = true; FVS_MSG = ''; salvar(); render(); return; }
   if (d.act === 'aba') { ABA = t.value; SVC = 'TODOS'; render(); return; }
   if (d.act === 'modo') { MODO = t.value; render(); return; }
   if (d.act === 'svc') { SVC = t.value; render(); return; }
