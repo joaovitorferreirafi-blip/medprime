@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.6.2
+// @version      1.6.3
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -12,15 +12,13 @@
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @connect      reports-api.sgq2.com.br
-// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js
 // @updateURL    https://raw.githubusercontent.com/joaovitorferreirafi-blip/medprime/main/MedPrime.user.js
 // @downloadURL  https://raw.githubusercontent.com/joaovitorferreirafi-blip/medprime/main/MedPrime.user.js
 // ==/UserScript==
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.6.2';
+const VERSAO = '1.6.3';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -820,29 +818,44 @@ function pedidoFvs() {
   return { d, ls, ids, ar: areasDoSGQ(ls) };
 }
 let FVS_MSG = '';
-async function gerarFvs(modo) {   // modo 'pdf' = baixa o PDF da FVS; 'junto' = devolve as páginas (imagens) para imprimir com boletim + croqui
+// relatório de FVS organizado: lê a tabela do SGQ (só leitura) e monta uma página própria, limpa, para imprimir/salvar em PDF
+function fvsLinhas(htmlB64) {
+  const html = new TextDecoder('utf-8').decode(b64bytes(htmlB64)).replace(/<script[\s\S]*?<\/script>/gi, '');
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const raw = tr => Array.from(tr.children).map(td => td.textContent.replace(/\s+/g, ' ').trim());
+  const seen = new Set(), out = [];
+  Array.from(doc.querySelectorAll('tr')).filter(tr => !tr.querySelector('tr')).map(raw).forEach(c => {
+    if (c.length < 20 || !/FVS \d/.test(c[3] || '') || c[0] === 'STATUS DA ÁREA') return;
+    const k = c.slice(0, 20).join('|'); if (seen.has(k)) return; seen.add(k); out.push(c.slice(0, 20));
+  });
+  return out.sort((x, y) => (x[3] + x[1]).localeCompare(y[3] + y[1], 'pt-BR', { numeric: true }));
+}
+function fvsDoc(linhas, d) {
+  const txt = v => esc(v || '');
+  const grupos = {}; linhas.forEach(c => { const k = c[3] + ' — ' + c[4]; (grupos[k] = grupos[k] || []).push(c); });
+  const cab = `<tr><th>Área (local)</th><th>Status da área</th><th>Status do checklist</th><th>Status da verificação</th><th>Abertura</th><th>Encerramento</th><th>Inspecionado por</th><th>Aprovado por</th><th>Itens</th><th>% aprovação</th><th>% retrabalho</th><th>% reprovação</th></tr>`;
+  const corpo = Object.keys(grupos).map(k => {
+    const ls = grupos[k];
+    const lin = ls.map(c => `<tr><td>${txt(c[1])}</td><td>${txt(c[0])}</td><td>${txt(c[2])}</td><td>${txt(c[9])}</td><td class="c">${txt(c[10])}</td><td class="c">${txt(c[11])}</td><td>${txt(c[12])}</td><td>${txt(c[13])}</td><td class="n">${txt(c[14])}</td><td class="n">${txt(c[15])}</td><td class="n">${txt(c[17])}</td><td class="n">${txt(c[18])}</td></tr>`).join('');
+    return `<div class="fvs-g"><div class="fvs-t">${txt(k)} <span class="muted">· ${ls.length} local(is)</span></div><table class="fvs-tb"><thead>${cab}</thead><tbody>${lin}</tbody></table></div>`;
+  }).join('');
+  return `<div class="doc fvs">
+   <div class="hd"><img src="${LOGO(1)}"><div class="tt">REALIZA CONSTRUTORA — FVS (MONITORAMENTO DE CHECKLIST)<div class="st">Obra: PRIME CLUBE · Uberlândia/MG</div></div><img src="${LOGO(2)}"></div>
+   <table class="inf"><tr><td class="k">EMPREITEIRO:</td><td class="v">${txt(d.a.titulo)}</td><td class="k">Medição:</td><td>${br(d.per)}</td></tr>
+   <tr><td class="k">PERÍODO:</td><td class="v">de ${br(iniDe(d.per))} a ${br(d.per)}</td><td class="k">FVS:</td><td>${Object.keys(grupos).length} FVS · ${linhas.length} local(is)</td></tr></table>
+   ${corpo || '<div class="box">Sem FVS para exibir.</div>'}
+   <div class="muted" style="margin-top:6px;font-size:9px">Dados do SGQ (somente leitura), gerados em ${new Date().toLocaleString('pt-BR').slice(0, 16)}. Só os locais lançados nesta medição.</div>
+  </div>`;
+}
+const FVS_CSS = `.fvs .fvs-g{margin:8px 0 10px;page-break-inside:auto}.fvs .fvs-t{background:#1F3864;color:#fff;font-weight:700;font-size:10px;padding:4px 6px}.fvs .fvs-tb{width:100%;border-collapse:collapse;font-size:8.5px}.fvs .fvs-tb th{background:#D9E2F3;border:1px solid #8EA9DB;padding:3px 4px;text-align:left}.fvs .fvs-tb td{border:1px solid #BFBFBF;padding:3px 4px;vertical-align:top}.fvs .fvs-tb tr{page-break-inside:avoid}.fvs .fvs-tb .n{text-align:right}.fvs .fvs-tb .c{text-align:center}.fvs .muted{color:#555;font-weight:400}.fvs .fvs-t .muted{color:#DDE6F5}`;
+async function fvsRelatorio() {   // devolve o HTML organizado (ou lança erro com o motivo)
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
   FVS_MSG = '⏳ Pedindo a FVS ao SGQ…'; render();
-  const n = contarFvs((await relatorioFvs(p.ids, p.ar.ids, 'text/html')).bytes);
-  if (!n) throw new Error('o SGQ não tem FVS desses serviços' + (p.ar.ids.length ? ' nesses locais' : '') + ': ' + p.ids.map(nomeFvs).join('; '));
-  const pdf = await relatorioFvs(p.ids, p.ar.ids, 'application/pdf');
-  FVS_MSG = `✔ ${n} FVS encontrada(s) no SGQ.`;
-  if (modo === 'pdf') { baixar(nomePdf('f') + '.pdf', b64bytes(pdf.bytes), 'application/pdf'); render(); return null; }
-  return { n, paginas: await pdfEmImagens(b64bytes(pdf.bytes)) };
-}
-async function pdfEmImagens(bytes) {
-  const lib = (typeof pdfjsLib !== 'undefined' && pdfjsLib) || globalThis.pdfjsLib || W.pdfjsLib;
-  if (!lib) throw new Error('o leitor de PDF não carregou — use o botão "FVS (PDF)" separado');
-  try { if (!lib.GlobalWorkerOptions.workerSrc) lib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch (e) {}
-  const pdf = await lib.getDocument({ data: bytes, isEvalSupported: false }).promise; const out = [];
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const pg = await pdf.getPage(i); const vp = pg.getViewport({ scale: 2 });
-    const cv = document.createElement('canvas'); cv.width = vp.width; cv.height = vp.height;
-    await pg.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
-    out.push({ src: cv.toDataURL('image/jpeg', 0.92), paisagem: vp.width > vp.height });
-  }
-  return out;
+  const linhas = fvsLinhas((await relatorioFvs(p.ids, p.ar.ids, 'text/html')).bytes);
+  if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços' + (p.ar.ids.length ? ' nesses locais' : '') + ': ' + p.ids.map(nomeFvs).join('; '));
+  FVS_MSG = `✔ ${linhas.length} local(is) de FVS encontrados no SGQ.`; render();
+  return fvsDoc(linhas, p.d);
 }
 function boxFvs() {
   const g = sgq();
@@ -889,15 +902,15 @@ async function gerarFvsXls() {
 }
 async function imprimir(kind) {
   if (kind === 'fx') { try { await gerarFvsXls(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); alert('FVS: ' + e.message); } return; }
-  if (kind === 'f') { try { await gerarFvs('pdf'); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); alert('FVS: ' + e.message); } return; }
-  let fvsPags = null;
-  if (kind === 'bcf') { try { fvsPags = (await gerarFvs('junto')).paginas; render(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); if (!confirm('FVS: ' + e.message + '\n\nImprimir só o boletim + croqui?')) return; kind = 'bc'; } }
+  let fvsHtml = null;
+  if (kind === 'f' || kind === 'bcf') { try { fvsHtml = await fvsRelatorio(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); if (kind === 'f') { alert('FVS: ' + e.message); return; } if (!confirm('FVS: ' + e.message + '\n\nImprimir só o boletim + croqui?')) return; kind = 'bc'; } }
   let body = '', orient = 'landscape';
   const nome = nomePdf(kind);
-  if (kind === 'b') { body = docBoletim(MODO); }
+  if (kind === 'f') { body = fvsHtml; }
+  else if (kind === 'b') { body = docBoletim(MODO); }
   else if (kind === 'c') { body = docCroqui(MODO); }
   else if (kind === 'bc' || kind === 'bcf') { body = docBoletim(MODO) + '<div style="page-break-before:always"></div>' + docCroqui(MODO);
-    if (fvsPags) body += fvsPags.map(pg => `<div style="page-break-before:always;width:100%;height:${pg.paisagem ? 190 : 270}mm;display:flex;align-items:center;justify-content:center"><img src="${pg.src}" style="max-width:100%;max-height:100%"></div>`).join(''); }
+    if (fvsHtml) body += '<div style="page-break-before:always"></div>' + fvsHtml; }
   else if (kind === 'c1') {
     const keep = SVC; const svcs = Array.from(new Set(dadosDoc(MODO).ls.filter(x => !ehDesconto(x.l)).map(x => x.l.serv)));
     body = svcs.map((s, i) => { SVC = s; return (i ? '<div style="page-break-before:always"></div>' : '') + docCroqui(MODO); }).join(''); SVC = keep;
@@ -905,7 +918,7 @@ async function imprimir(kind) {
   const fr = document.createElement('iframe'); fr.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0';
   document.body.appendChild(fr);
   const dd = fr.contentDocument; dd.open();
-  dd.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(nome)}</title><style>@page{size:A4 ${orient};margin:7mm}body{margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact}${DOC_CSS}</style></head><body>${body}</body></html>`);
+  dd.write(`<!doctype html><html><head><meta charset="utf-8"><title>${esc(nome)}</title><style>@page{size:A4 ${orient};margin:7mm}body{margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact}${DOC_CSS}${FVS_CSS}</style></head><body>${body}</body></html>`);
   dd.close();
   // o Chrome sugere o nome do PDF pelo título da página: troca o título enquanto a janela de impressão está aberta e depois volta
   const tituloAntes = document.title; let voltou = false;
