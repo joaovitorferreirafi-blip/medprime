@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.6.0
+// @version      1.6.2
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -20,7 +20,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.6.0';
+const VERSAO = '1.6.2';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -769,20 +769,27 @@ function fvsDoServ(aba, serv, obs) {   // { ids:[...], salvo:true|false }
 const nomeFvs = id => { const g = sgq(); const x = g && g.servs.find(s => s[0] === +id); return x ? x[1] : 'FVS ' + id; };
 // locais medidos -> áreas do SGQ (BLOCO 01 - APTO 108, BLOCO 01 - 00 TÉRREO, BLOCO 01, - PORTARIA ...)
 function areasDoSGQ(linhasDoc) {
+  // só as áreas que foram medidas: apto citado = a área do apto; sem apto citado (ex.: radier, fundação do bloco) = a área do bloco.
+  // NÃO adiciona o pavimento nem o bloco inteiro quando a medição cita aptos.
   const g = sgq(); if (!g) return { ids: [], nomes: [] };
   const porNome = {}; g.areas.forEach(([id, n]) => { porNome[semac(n).replace(/\s+/g, ' ').trim()] = id; });
   const quer = new Set(); const p2 = n => String(n).padStart(2, '0');
   linhasDoc.forEach(x => {
+    const loc = semac(x.l.local);
+    const expl = /TODOS/.test(loc) || aptos(loc).length > 0 || halls(loc).length > 0;   // a linha cita aptos/halls de forma explícita?
     chavesDaLinha(x.l.local, x.l.obs, x.l.serv).chaves.forEach(k => {
       const p = k.split('|');
-      if (p[0] === 'B') { const f = Math.floor(+p[2] / 100); quer.add(`BLOCO ${p2(p[1])}`); quer.add(`BLOCO ${p2(p[1])} - APTO ${p[2]}`); quer.add(`BLOCO ${p2(p[1])} - ${f === 1 ? '00 TERREO' : p2(f - 1) + 'º PAVIMENTO'}`); }
-      else if (p[0] === 'H') { const f = +p[3]; quer.add(`BLOCO ${p2(p[1])}`); quer.add(`BLOCO ${p2(p[1])} - ${f === 1 ? '00 TERREO' : p2(f - 1) + 'º PAVIMENTO'}`); }
-      else if (p[0] === 'A') { const kw = (mapaObj()[k] || {}).kw || p[1]; g.areas.forEach(([id, n]) => { if (!/^\s*BLOCO/i.test(n) && casa(semac(n), kw)) quer.add(semac(n).replace(/\s+/g, ' ').trim()); }); }
+      if (p[0] === 'A') { const kw = (mapaObj()[k] || {}).kw || p[1]; g.areas.forEach(([id, n]) => { if (!/^\s*BLOCO/i.test(n) && casa(semac(n), kw)) quer.add(semac(n).replace(/\s+/g, ' ').trim()); }); }
+      else if (p[0] === 'B') { quer.add(expl ? `BLOCO ${p2(p[1])} - APTO ${p[2]}` : `BLOCO ${p2(p[1])}`); }
+      else if (p[0] === 'H') {
+        const f = +p[3], lado = p[2] === 'A' ? [1, 2, 3, 4] : [5, 6, 7, 8];
+        if (expl) lado.forEach(u => quer.add(`BLOCO ${p2(p[1])} - APTO ${f * 100 + u}`)); else quer.add(`BLOCO ${p2(p[1])}`);
+      }
     });
   });
   const ids = [], nomes = [];
   quer.forEach(n => { const id = porNome[semac(n)]; if (id && ids.indexOf(id) < 0) { ids.push(id); nomes.push(n); } });
-  return { ids, nomes };
+  return { ids, nomes, naoAchou: Array.from(quer).filter(n => !porNome[semac(n)]) };
 }
 function gmPost(url, corpo, headers) {
   return new Promise((ok, falha) => {
@@ -858,10 +865,10 @@ function vDoc(kind) {
   return `<h2>${kind === 'b' ? 'Boletim' : 'Croqui'} — ${esc(nomeAba(ABA || S.abas[0].nome))}</h2>
   <div class="bar">${selAba()}<label>Tipo</label><select data-act="modo"><option value="E" ${MODO === 'E' ? 'selected' : ''}>Medição executada</option><option value="P" ${MODO === 'P' ? 'selected' : ''}>Medição prevista</option></select>
   ${kind === 'c' ? `<label>Serviço</label><select data-act="svc" style="max-width:360px"><option value="TODOS">TODOS OS SERVIÇOS</option>${svcs.map(s => `<option value="${esc(s)}" ${s === SVC ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select>` : ''}
-  <span style="flex:1"></span><button class="btn g" data-print="${kind}">🖨️ Imprimir / Salvar PDF</button>${kind === 'c' ? '<button class="btn w" data-print="c1">PDF de cada serviço</button>' : '<button class="btn w" data-print="bc">Boletim + croqui juntos</button><button class="btn w" data-print="f" title="baixa o relatório Monitoramento de Checklist do SGQ">📋 FVS (PDF)</button><button class="btn w" data-print="bcf">Boletim + croqui + FVS</button>'}</div>
+  <span style="flex:1"></span><button class="btn g" data-print="${kind}">🖨️ Imprimir / Salvar PDF</button>${kind === 'c' ? '<button class="btn w" data-print="c1">PDF de cada serviço</button>' : '<button class="btn w" data-print="bc">Boletim + croqui juntos</button><button class="btn w" data-print="f" title="baixa o relatório Monitoramento de Checklist do SGQ em PDF">📋 FVS (PDF)</button><button class="btn w" data-print="fx" title="baixa o mesmo relatório do SGQ em Excel">📊 FVS (Excel)</button><button class="btn w" data-print="bcf">Boletim + croqui + FVS</button>'}</div>
   ${kind === 'b' && MODO === 'E' ? boxFvs() : ''}
   <div class="prev" style="width:${kind === 'b' ? 1050 : 1120}px"><style>${DOC_CSS}</style>${kind === 'b' ? docBoletim(MODO) : docCroqui(MODO)}</div>
-  <p class="muted">No "Imprimir", escolha a impressora "Salvar como PDF" — o arquivo já vem com o nome: <b>${esc(nomePdf(kind))}.pdf</b>${kind === 'b' ? ` (boletim + croqui juntos: <b>${esc(nomePdf('bc'))}.pdf</b> · FVS: <b>${esc(nomePdf('f'))}.pdf</b> · tudo junto: <b>${esc(nomePdf('bcf'))}.pdf</b>)` : ''}</p>`;
+  <p class="muted">No "Imprimir", escolha a impressora "Salvar como PDF" — o arquivo já vem com o nome: <b>${esc(nomePdf(kind))}.pdf</b>${kind === 'b' ? ` (boletim + croqui juntos: <b>${esc(nomePdf('bc'))}.pdf</b> · FVS: <b>${esc(nomePdf('f'))}.pdf</b> ou <b>.xls</b> · tudo junto: <b>${esc(nomePdf('bcf'))}.pdf</b>)` : ''}</p>`;
 }
 const vBoletim = () => vDoc('b'), vCroqui = () => vDoc('c');
 function nomePdf(kind) {
@@ -869,7 +876,19 @@ function nomePdf(kind) {
   const svc = kind === 'c' && SVC !== 'TODOS' ? ' - ' + SVC : '';
   return `MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${ABA} - ${tipo}${svc}${MODO === 'P' ? ' PREVISTA' : ''}`.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 180);
 }
+async function gerarFvsXls() {
+  const p = pedidoFvs();
+  if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
+  FVS_MSG = '⏳ Pedindo a FVS em Excel ao SGQ…'; render();
+  const n = contarFvs((await relatorioFvs(p.ids, p.ar.ids, 'text/html')).bytes);
+  if (!n) throw new Error('o SGQ não tem FVS desses serviços' + (p.ar.ids.length ? ' nesses locais' : '') + ': ' + p.ids.map(nomeFvs).join('; '));
+  const xls = await relatorioFvs(p.ids, p.ar.ids, 'application/vnd.ms-excel');
+  FVS_MSG = `✔ ${n} FVS em Excel baixada(s).`;
+  baixar(nomePdf('f') + '.xls', b64bytes(xls.bytes), 'application/vnd.ms-excel');
+  render();
+}
 async function imprimir(kind) {
+  if (kind === 'fx') { try { await gerarFvsXls(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); alert('FVS: ' + e.message); } return; }
   if (kind === 'f') { try { await gerarFvs('pdf'); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); alert('FVS: ' + e.message); } return; }
   let fvsPags = null;
   if (kind === 'bcf') { try { fvsPags = (await gerarFvs('junto')).paginas; render(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); if (!confirm('FVS: ' + e.message + '\n\nImprimir só o boletim + croqui?')) return; kind = 'bc'; } }
