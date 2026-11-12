@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.6.3
+// @version      1.6.5
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -18,7 +18,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.6.3';
+const VERSAO = '1.6.5';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -774,7 +774,9 @@ function areasDoSGQ(linhasDoc) {
   const quer = new Set(); const p2 = n => String(n).padStart(2, '0');
   linhasDoc.forEach(x => {
     const loc = semac(x.l.local);
-    const expl = /TODOS/.test(loc) || aptos(loc).length > 0 || halls(loc).length > 0;   // a linha cita aptos/halls de forma explícita?
+    // v1.6.4: "BLOCO 12 (TODOS OS APTOS)" sem apto/hall citado = local de BLOCO (FVS de fiada, contrapiso, radier).
+    // Só vira apto quando a linha cita apto ou hall de forma explícita.
+    const expl = aptos(loc).length > 0 || halls(loc).length > 0;
     chavesDaLinha(x.l.local, x.l.obs, x.l.serv).chaves.forEach(k => {
       const p = k.split('|');
       if (p[0] === 'A') { const kw = (mapaObj()[k] || {}).kw || p[1]; g.areas.forEach(([id, n]) => { if (!/^\s*BLOCO/i.test(n) && casa(semac(n), kw)) quer.add(semac(n).replace(/\s+/g, ' ').trim()); }); }
@@ -851,8 +853,20 @@ const FVS_CSS = `.fvs .fvs-g{margin:8px 0 10px;page-break-inside:auto}.fvs .fvs-
 async function fvsRelatorio() {   // devolve o HTML organizado (ou lança erro com o motivo)
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
-  FVS_MSG = '⏳ Pedindo a FVS ao SGQ…'; render();
-  const linhas = fvsLinhas((await relatorioFvs(p.ids, p.ar.ids, 'text/html')).bytes);
+  // v1.6.4: pede cada FVS SEM filtro de área (não depende dos IDs de área, que falham para FVS de bloco
+  // como fiada falsa, contrapiso e radier) e filtra as linhas pelo NOME do local medido.
+  const nomesOk = new Set(p.ar.nomes.map(n => semac(n).replace(/\s+/g, ' ').trim()));
+  let todas = [];
+  for (let i = 0; i < p.ids.length; i++) {
+    FVS_MSG = `⏳ Pedindo a FVS ${i + 1} de ${p.ids.length} ao SGQ…`; render();
+    todas = todas.concat(fvsLinhas((await relatorioFvs([p.ids[i]], [], 'text/html')).bytes));
+  }
+  const vistos = new Set(), linhas = [];
+  todas.forEach(c => {
+    if (nomesOk.size && !nomesOk.has(semac(c[1]).replace(/\s+/g, ' ').trim())) return;
+    const k = c.join('|'); if (vistos.has(k)) return; vistos.add(k); linhas.push(c);
+  });
+  linhas.sort((x, y) => (x[3] + x[1]).localeCompare(y[3] + y[1], 'pt-BR', { numeric: true }));
   if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços' + (p.ar.ids.length ? ' nesses locais' : '') + ': ' + p.ids.map(nomeFvs).join('; '));
   FVS_MSG = `✔ ${linhas.length} local(is) de FVS encontrados no SGQ.`; render();
   return fvsDoc(linhas, p.d);
