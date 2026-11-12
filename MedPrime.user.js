@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.6.8
+// @version      1.6.9
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -18,7 +18,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.6.8';
+const VERSAO = '1.6.9';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -906,25 +906,23 @@ function nomePdf(kind) {
   const svc = kind === 'c' && SVC !== 'TODOS' ? ' - ' + SVC : '';
   return `MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${ABA} - ${tipo}${svc}${MODO === 'P' ? ' PREVISTA' : ''}`.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 180);
 }
-async function gerarFvsXls() {   // Excel do SGQ (arquivo original). Um pedido por FVS, só com os locais que usam essa FVS
+async function gerarFvsXls() {   // UM arquivo Excel do SGQ com todas as FVS da medição (layout do SGQ), só com os locais lançados
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
-  const arquivos = [];
-  for (let i = 0; i < p.ids.length; i++) {
-    const id = p.ids[i];
-    const doFvs = p.ls.filter(x => fvsDoServ(p.d.a.nome, x.l.serv, x.l.obs).ids.indexOf(id) >= 0);
-    const ar = areasDoSGQ(doFvs);
-    if (!ar.ids.length) continue;
-    FVS_MSG = `⏳ Baixando a FVS ${i + 1} de ${p.ids.length} do SGQ…`; render();
-    const n = contarFvs((await relatorioFvs([id], ar.ids, 'text/html')).bytes);
-    if (!n) continue;
-    const xls = await relatorioFvs([id], ar.ids, 'application/vnd.ms-excel');
-    const cod = nomeFvs(id).split(' ').slice(0, 2).join(' ').replace('FVS ', '');
-    arquivos.push({ nome: nomePdf('f') + ' ' + cod + '.xls', bytes: xls.bytes });
-  }
-  if (!arquivos.length) throw new Error('o SGQ não tem FVS desses serviços nesses locais: ' + p.ids.map(nomeFvs).join('; '));
-  arquivos.forEach(a => baixar(a.nome, b64bytes(a.bytes), 'application/vnd.ms-excel'));
-  FVS_MSG = `✔ ${arquivos.length} arquivo(s) de FVS Excel do SGQ baixado(s).`; render();
+  const linhas = await fvsLinhasDoPedido(p);
+  if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços nesses locais: ' + p.ids.map(nomeFvs).join('; '));
+  const permitidos = new Set(linhas.map(c => c[3] + '|' + normLoc(c[1])));
+  FVS_MSG = '⏳ Montando o Excel do SGQ…'; render();
+  const j = await relatorioFvs(p.ids, p.ar.ids, 'text/html');
+  const html = new TextDecoder('utf-8').decode(b64bytes(j.bytes)).replace(/<script[\s\S]*?<\/script>/gi, '');
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  Array.from(doc.querySelectorAll('tr')).filter(tr => !tr.querySelector('tr')).forEach(tr => {
+    const c = Array.from(tr.children).map(td => td.textContent.replace(/\s+/g, ' ').trim());
+    if (c.length >= 20 && /FVS \d/.test(c[3] || '') && !permitidos.has(c[3] + '|' + normLoc(c[1]))) tr.remove();
+  });
+  const bytes = new TextEncoder().encode('<!DOCTYPE html>\n' + doc.documentElement.outerHTML);
+  FVS_MSG = `✔ Excel do SGQ com ${linhas.length} local(is) de FVS.`; render();
+  baixar(nomePdf('f') + '.xls', bytes, 'application/vnd.ms-excel');
 }
 async function imprimir(kind) {
   if (kind === 'fx') { try { await gerarFvsXls(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); alert('FVS: ' + e.message); } return; }
