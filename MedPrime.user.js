@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.6.6
+// @version      1.6.7
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -18,7 +18,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.6.6';
+const VERSAO = '1.6.7';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -850,24 +850,27 @@ function fvsDoc(linhas, d) {
   </div>`;
 }
 const FVS_CSS = `.fvs .fvs-g{margin:8px 0 10px;page-break-inside:auto}.fvs .fvs-t{background:#1F3864;color:#fff;font-weight:700;font-size:10px;padding:4px 6px}.fvs .fvs-tb{width:100%;border-collapse:collapse;font-size:8.5px}.fvs .fvs-tb th{background:#D9E2F3;border:1px solid #8EA9DB;padding:3px 4px;text-align:left}.fvs .fvs-tb td{border:1px solid #BFBFBF;padding:3px 4px;vertical-align:top}.fvs .fvs-tb tr{page-break-inside:avoid}.fvs .fvs-tb .n{text-align:right}.fvs .fvs-tb .c{text-align:center}.fvs .muted{color:#555;font-weight:400}.fvs .fvs-t .muted{color:#DDE6F5}`;
+// v1.6.6: cada FVS só traz os locais das linhas da medição que usam ESSA FVS (não a união de todas)
+const normLoc = v => semac(v).replace(/\s+/g, ' ').trim();
+async function fvsLinhasDoPedido(p) {
+  const todas = [];
+  for (let i = 0; i < p.ids.length; i++) {
+    const id = p.ids[i];
+    FVS_MSG = `⏳ Pedindo a FVS ${i + 1} de ${p.ids.length} ao SGQ…`; render();
+    const doFvs = p.ls.filter(x => fvsDoServ(p.d.a.nome, x.l.serv, x.l.obs).ids.indexOf(id) >= 0);
+    const nomesF = new Set(areasDoSGQ(doFvs).nomes.map(normLoc));
+    const linhas = fvsLinhas((await relatorioFvs([id], [], 'text/html')).bytes).filter(c => nomesF.has(normLoc(c[1])));
+    todas.push(...linhas);
+  }
+  const vistos = new Set(), out = [];
+  todas.forEach(c => { const k = c.join('|'); if (vistos.has(k)) return; vistos.add(k); out.push(c); });
+  return out.sort((x, y) => (x[3] + x[1]).localeCompare(y[3] + y[1], 'pt-BR', { numeric: true }));
+}
 async function fvsRelatorio() {   // devolve o HTML organizado (ou lança erro com o motivo)
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
-  // v1.6.4: pede cada FVS SEM filtro de área (não depende dos IDs de área, que falham para FVS de bloco
-  // como fiada falsa, contrapiso e radier) e filtra as linhas pelo NOME do local medido.
-  const nomesOk = new Set(p.ar.nomes.map(n => semac(n).replace(/\s+/g, ' ').trim()));
-  let todas = [];
-  for (let i = 0; i < p.ids.length; i++) {
-    FVS_MSG = `⏳ Pedindo a FVS ${i + 1} de ${p.ids.length} ao SGQ…`; render();
-    todas = todas.concat(fvsLinhas((await relatorioFvs([p.ids[i]], [], 'text/html')).bytes));
-  }
-  const vistos = new Set(), linhas = [];
-  todas.forEach(c => {
-    if (nomesOk.size && !nomesOk.has(semac(c[1]).replace(/\s+/g, ' ').trim())) return;
-    const k = c.join('|'); if (vistos.has(k)) return; vistos.add(k); linhas.push(c);
-  });
-  linhas.sort((x, y) => (x[3] + x[1]).localeCompare(y[3] + y[1], 'pt-BR', { numeric: true }));
-  if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços' + (p.ar.ids.length ? ' nesses locais' : '') + ': ' + p.ids.map(nomeFvs).join('; '));
+  const linhas = await fvsLinhasDoPedido(p);
+  if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços nesses locais: ' + p.ids.map(nomeFvs).join('; '));
   FVS_MSG = `✔ ${linhas.length} local(is) de FVS encontrados no SGQ.`; render();
   return fvsDoc(linhas, p.d);
 }
@@ -903,15 +906,17 @@ function nomePdf(kind) {
   const svc = kind === 'c' && SVC !== 'TODOS' ? ' - ' + SVC : '';
   return `MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${ABA} - ${tipo}${svc}${MODO === 'P' ? ' PREVISTA' : ''}`.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 180);
 }
-async function gerarFvsXls() {
+async function gerarFvsXls() {   // Excel montado com as mesmas linhas filtradas do PDF (tabela HTML em .xls, abre no Excel)
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
-  FVS_MSG = '⏳ Pedindo a FVS em Excel ao SGQ…'; render();
-  const n = contarFvs((await relatorioFvs(p.ids, p.ar.ids, 'text/html')).bytes);
-  if (!n) throw new Error('o SGQ não tem FVS desses serviços' + (p.ar.ids.length ? ' nesses locais' : '') + ': ' + p.ids.map(nomeFvs).join('; '));
-  const xls = await relatorioFvs(p.ids, p.ar.ids, 'application/vnd.ms-excel');
-  FVS_MSG = `✔ ${n} FVS em Excel baixada(s).`;
-  baixar(nomePdf('f') + '.xls', b64bytes(xls.bytes), 'application/vnd.ms-excel');
+  const linhas = await fvsLinhasDoPedido(p);
+  if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços nesses locais: ' + p.ids.map(nomeFvs).join('; '));
+  const t = v => esc(v || '');
+  const cab = ['Código FVS','Nome do serviço','Área (local)','Status da área','Status do checklist','Status da verificação','Abertura','Encerramento','Inspecionado por','Aprovado por','Itens','% aprovação','% retrabalho','% reprovação'];
+  const lin = linhas.map(c => `<tr><td>${t(c[3])}</td><td>${t(c[4])}</td><td>${t(c[1])}</td><td>${t(c[0])}</td><td>${t(c[2])}</td><td>${t(c[9])}</td><td>${t(c[10])}</td><td>${t(c[11])}</td><td>${t(c[12])}</td><td>${t(c[13])}</td><td>${t(c[14])}</td><td>${t(c[15])}</td><td>${t(c[17])}</td><td>${t(c[18])}</td></tr>`).join('');
+  const html = `<html xmlns:x="urn:schemas-microsoft-com:office:excel"><head><meta charset="utf-8"></head><body><table border="1"><tr>${cab.map(h => `<th>${h}</th>`).join('')}</tr>${lin}</table></body></html>`;
+  FVS_MSG = `✔ ${linhas.length} local(is) de FVS em Excel.`; render();
+  baixar(nomePdf('f') + '.xls', new TextEncoder().encode(html), 'application/vnd.ms-excel');
   render();
 }
 async function imprimir(kind) {
