@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.6.5
+// @version      1.6.6
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -18,7 +18,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.6.5';
+const VERSAO = '1.6.6';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -1099,7 +1099,7 @@ function abrirPicker(id) {
     else if (hB.length === 4 && !hA.length) hTxt = 'HALL B';
     else if (hA.length + hB.length) { const l2 = []; for (let f = 1; f <= 4; f++) { if (sel.hl.has(f + 'A')) l2.push(f + 'A'); if (sel.hl.has(f + 'B')) l2.push(f + 'B'); } hTxt = 'HALL ' + l2.join(', '); }
     let t = 'BLOCO ' + String(b).padStart(2, '0');
-    if (!ap.length && !hTxt) return t + ' (TODOS OS APTOS)';
+    if (!ap.length && !hTxt) return t;   // só o número do bloco clicado = local BLOCO nn (não escreve TODOS OS APTOS)
     if (ap.length === all.length) return t + ' (TODOS OS APTOS)' + (hTxt ? ' + ' + hTxt : '');
     const fx = []; let i = 0;
     while (i < ap.length) { let a = ap[i], z = a; while (i + 1 < ap.length && ap[i + 1] === z + 1 && Math.floor(ap[i + 1] / 100) === Math.floor(z / 100)) { z = ap[++i]; } fx.push(z > a ? a + ' AO ' + z : String(a)); i++; }
