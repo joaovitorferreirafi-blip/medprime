@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.6.9
+// @version      1.7.5
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
 // @run-at       document-idle
 // @noframes
+// @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -18,7 +19,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.6.9';
+const VERSAO = '1.7.5';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -852,15 +853,24 @@ function fvsDoc(linhas, d) {
 const FVS_CSS = `.fvs .fvs-g{margin:8px 0 10px;page-break-inside:auto}.fvs .fvs-t{background:#1F3864;color:#fff;font-weight:700;font-size:10px;padding:4px 6px}.fvs .fvs-tb{width:100%;border-collapse:collapse;font-size:8.5px}.fvs .fvs-tb th{background:#D9E2F3;border:1px solid #8EA9DB;padding:3px 4px;text-align:left}.fvs .fvs-tb td{border:1px solid #BFBFBF;padding:3px 4px;vertical-align:top}.fvs .fvs-tb tr{page-break-inside:avoid}.fvs .fvs-tb .n{text-align:right}.fvs .fvs-tb .c{text-align:center}.fvs .muted{color:#555;font-weight:400}.fvs .fvs-t .muted{color:#DDE6F5}`;
 // v1.6.6: cada FVS só traz os locais das linhas da medição que usam ESSA FVS (não a união de todas)
 const normLoc = v => semac(v).replace(/\s+/g, ' ').trim();
+function erroFvs(p) { const g = sgq(); return 'o SGQ não devolveu linhas para estas FVS: ' + p.ids.map(nomeFvs).join('; ') + '\n\nDiagnóstico: ' + (p.diag || ['(sem diagnóstico)']).join(' | ') + '\nCópia do SGQ: obra ' + (g && g.idObra) + ', usuário ' + (g && g.idUsuario) + ', áreas ' + (g && g.areas ? g.areas.length : 0) + ', salva em ' + (g && g.em ? g.em.slice(0, 16) : '—') + '. Se a cópia estiver velha, abra o SGQ (logado) na Checklist de Área e tente de novo.'; }
 async function fvsLinhasDoPedido(p) {
   const todas = [];
+  const p2 = n => String(n).padStart(2, '0');
   for (let i = 0; i < p.ids.length; i++) {
     const id = p.ids[i];
     FVS_MSG = `⏳ Pedindo a FVS ${i + 1} de ${p.ids.length} ao SGQ…`; render();
     const doFvs = p.ls.filter(x => fvsDoServ(p.d.a.nome, x.l.serv, x.l.obs).ids.indexOf(id) >= 0);
     const nomesF = new Set(areasDoSGQ(doFvs).nomes.map(normLoc));
-    const linhas = fvsLinhas((await relatorioFvs([id], [], 'text/html')).bytes).filter(c => nomesF.has(normLoc(c[1])));
-    todas.push(...linhas);
+    const todasDoServ = fvsLinhas((await relatorioFvs([id], [], 'text/html')).bytes);
+    // locais por apartamento que o SGQ tem para esta FVS
+    const linhas = todasDoServ.filter(c => nomesF.has(normLoc(c[1])));
+    // opção A: se o SGQ não tem nenhum apartamento desta FVS num bloco lançado, usa a FVS cadastrada no BLOCO inteiro
+    const blocosLancados = new Set(); doFvs.forEach(x => blocos(x.l.local).forEach(b => blocosLancados.add(p2(b))));
+    const blocoComApto = new Set(linhas.map(c => { const m = normLoc(c[1]).match(/^BLOCO (\d{2}) - APTO/); return m ? m[1] : null; }).filter(Boolean));
+    const blocoInteiro = todasDoServ.filter(c => { const m = normLoc(c[1]).match(/^BLOCO (\d{2})$/); return m && blocosLancados.has(m[1]) && !blocoComApto.has(m[1]); });
+    todas.push(...linhas, ...blocoInteiro);
+    p.diag = (p.diag || []).concat([`${nomeFvs(id).split(' ').slice(0, 2).join(' ')}: SGQ=${todasDoServ.length} linha(s), locais medidos=${nomesF.size}, achadas=${linhas.length + blocoInteiro.length}`]);
   }
   const vistos = new Set(), out = [];
   todas.forEach(c => { const k = c.join('|'); if (vistos.has(k)) return; vistos.add(k); out.push(c); });
@@ -870,7 +880,7 @@ async function fvsRelatorio() {   // devolve o HTML organizado (ou lança erro c
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
   const linhas = await fvsLinhasDoPedido(p);
-  if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços nesses locais: ' + p.ids.map(nomeFvs).join('; '));
+  if (!linhas.length) throw new Error(erroFvs(p));
   FVS_MSG = `✔ ${linhas.length} local(is) de FVS encontrados no SGQ.`; render();
   return fvsDoc(linhas, p.d);
 }
@@ -906,22 +916,78 @@ function nomePdf(kind) {
   const svc = kind === 'c' && SVC !== 'TODOS' ? ' - ' + SVC : '';
   return `MEDIÇÃO ${br(S.dataMed).replace(/\//g, '-')} - ${ABA} - ${tipo}${svc}${MODO === 'P' ? ' PREVISTA' : ''}`.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 180);
 }
-async function gerarFvsXls() {   // UM arquivo Excel do SGQ com todas as FVS da medição (layout do SGQ), só com os locais lançados
+// ---- .xlsx (arquivo Excel de verdade, sem aviso de formato) ----
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc32 = u8 => { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+function zipStore(files) {   // zip sem compressão (formato aceito pelo Excel)
+  const enc = new TextEncoder(), parts = [], cd = []; let off = 0;
+  files.forEach(f => {
+    const nm = enc.encode(f.name), crc = crc32(f.data), sz = f.data.length;
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(12, 0x21, true);
+    h.setUint32(14, crc, true); h.setUint32(18, sz, true); h.setUint32(22, sz, true); h.setUint16(26, nm.length, true);
+    parts.push(new Uint8Array(h.buffer), nm, f.data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(14, 0x21, true);
+    c.setUint32(16, crc, true); c.setUint32(20, sz, true); c.setUint32(24, sz, true); c.setUint16(28, nm.length, true); c.setUint32(42, off, true);
+    cd.push(new Uint8Array(c.buffer), nm);
+    off += 30 + nm.length + sz;
+  });
+  const cdSize = cd.reduce((s, x) => s + x.length, 0);
+  const e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true); e.setUint32(12, cdSize, true); e.setUint32(16, off, true);
+  const all = [...parts, ...cd, new Uint8Array(e.buffer)];
+  const out = new Uint8Array(all.reduce((s, x) => s + x.length, 0)); let q = 0; all.forEach(x => { out.set(x, q); q += x.length; });
+  return out;
+}
+function xlsxBytes(rows) {
+  const xm = v => String(v == null ? '' : v).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch])).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  const col = i => String.fromCharCode(65 + i);
+  const sd = rows.map((r, ri) => `<row r="${ri + 1}">` + r.map((v, ci) => `<c r="${col(ci)}${ri + 1}" t="inlineStr"><is><t xml:space="preserve">${xm(v)}</t></is></c>`).join('') + '</row>').join('');
+  const enc = x => new TextEncoder().encode(x);
+  const H = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  return zipStore([
+    { name: '[Content_Types].xml', data: enc(H + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>') },
+    { name: '_rels/.rels', data: enc(H + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>') },
+    { name: 'xl/workbook.xml', data: enc(H + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="FVS" sheetId="1" r:id="rId1"/></sheets></workbook>') },
+    { name: 'xl/_rels/workbook.xml.rels', data: enc(H + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>') },
+    { name: 'xl/worksheets/sheet1.xml', data: enc(H + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sd}</sheetData></worksheet>`) },
+  ]);
+}
+async function gerarFvsXls() {   // relatório Excel do SGQ, só com os locais lançados na medição
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
   const linhas = await fvsLinhasDoPedido(p);
-  if (!linhas.length) throw new Error('o SGQ não tem FVS desses serviços nesses locais: ' + p.ids.map(nomeFvs).join('; '));
-  const permitidos = new Set(linhas.map(c => c[3] + '|' + normLoc(c[1])));
-  FVS_MSG = '⏳ Montando o Excel do SGQ…'; render();
-  const j = await relatorioFvs(p.ids, p.ar.ids, 'text/html');
-  const html = new TextDecoder('utf-8').decode(b64bytes(j.bytes)).replace(/<script[\s\S]*?<\/script>/gi, '');
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  Array.from(doc.querySelectorAll('tr')).filter(tr => !tr.querySelector('tr')).forEach(tr => {
-    const c = Array.from(tr.children).map(td => td.textContent.replace(/\s+/g, ' ').trim());
-    if (c.length >= 20 && /FVS \d/.test(c[3] || '') && !permitidos.has(c[3] + '|' + normLoc(c[1]))) tr.remove();
+  if (!linhas.length) throw new Error(erroFvs(p));
+  const pares = new Set(linhas.map(c => c[3] + '|' + normLoc(c[1])));
+  FVS_MSG = '⏳ Montando o relatório do SGQ…'; render();
+  const xls = await relatorioFvs(p.ids, p.ar.ids, 'application/vnd.ms-excel');   // arquivo do SGQ
+  if (typeof XLSX === 'undefined') throw new Error('a biblioteca do Excel não carregou (confira a internet e reinstale o script)');
+  const wb = XLSX.read(b64bytes(xls.bytes), { type: 'array' });
+  const nomeAba = wb.SheetNames[0]; const ws = wb.Sheets[nomeAba];
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });   // raw:false = datas e percentuais como aparecem no SGQ
+  const saida = []; let dados = 0;
+  aoa.forEach(r => {   // cabeçalho e títulos ficam; linha de FVS fica só se o local dela foi lançado nesta FVS (não depende da posição da coluna)
+    if (r.every(v => String(v).trim() === '')) return;   // tira as linhas em branco que sobravam
+    const codigo = r.map(v => String(v).trim()).find(v => /^FVS \d/.test(v));
+    if (!codigo) { saida.push(r); return; }
+    if (r.some(v => pares.has(codigo + '|' + normLoc(String(v))))) { saida.push(r); dados++; }
   });
-  const bytes = new TextEncoder().encode('<!DOCTYPE html>\n' + doc.documentElement.outerHTML);
-  FVS_MSG = `✔ Excel do SGQ com ${linhas.length} local(is) de FVS.`; render();
+  let bytes, msg;
+  if (dados) {
+    const nova = XLSX.utils.aoa_to_sheet(saida);
+    if (ws['!cols']) nova['!cols'] = ws['!cols'];
+    const wb2 = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb2, nova, nomeAba);
+    bytes = new Uint8Array(XLSX.write(wb2, { bookType: 'biff8', type: 'array' }));
+    msg = `✔ Relatório do SGQ com ${dados} linha(s) de FVS.`;
+  } else {   // o arquivo do SGQ veio sem as linhas esperadas: monta a planilha com os mesmos dados conferidos
+    const cab = ['STATUS DA ÁREA', 'NOME DA ÁREA', 'STATUS DO CHECKLIST', 'CÓDIGO DO SERVIÇO', 'NOME DO SERVIÇO', 'LOCAL 1', 'LOCAL 2', 'LOCAL 3', 'LOCAL 4', 'STATUS DA VERIFICAÇÃO', 'DATA DE ABERTURA', 'DATA DE ENCERRAMENTO', 'INSPECIONADO POR', 'APROVADO POR', 'Nº DE ITENS', '% APROVAÇÃO', 'I.R', '% RETRABALHO APROVADO', '% REPROVADO', '% NÃO SE APLICA'];
+    const nova = XLSX.utils.aoa_to_sheet([cab, ...linhas.map(c => c.slice(0, 20))]);
+    const wb2 = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb2, nova, 'FVS');
+    bytes = new Uint8Array(XLSX.write(wb2, { bookType: 'biff8', type: 'array' }));
+    msg = `⚠ O arquivo do SGQ veio sem as linhas esperadas; a planilha foi montada com ${linhas.length} local(is) conferidos.`;
+  }
+  FVS_MSG = msg; render();
   baixar(nomePdf('f') + '.xls', bytes, 'application/vnd.ms-excel');
 }
 async function imprimir(kind) {
