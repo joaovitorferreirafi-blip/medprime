@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.7.5
+// @version      1.7.10
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -19,7 +19,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.7.5';
+const VERSAO = '1.7.10';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -954,41 +954,15 @@ function xlsxBytes(rows) {
     { name: 'xl/worksheets/sheet1.xml', data: enc(H + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sd}</sheetData></worksheet>`) },
   ]);
 }
-async function gerarFvsXls() {   // relatório Excel do SGQ, só com os locais lançados na medição
+async function gerarFvsXls() {   // baixa o Excel exatamente como o SGQ gera (sem mexer no arquivo)
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
   const linhas = await fvsLinhasDoPedido(p);
   if (!linhas.length) throw new Error(erroFvs(p));
-  const pares = new Set(linhas.map(c => c[3] + '|' + normLoc(c[1])));
-  FVS_MSG = '⏳ Montando o relatório do SGQ…'; render();
-  const xls = await relatorioFvs(p.ids, p.ar.ids, 'application/vnd.ms-excel');   // arquivo do SGQ
-  if (typeof XLSX === 'undefined') throw new Error('a biblioteca do Excel não carregou (confira a internet e reinstale o script)');
-  const wb = XLSX.read(b64bytes(xls.bytes), { type: 'array' });
-  const nomeAba = wb.SheetNames[0]; const ws = wb.Sheets[nomeAba];
-  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });   // raw:false = datas e percentuais como aparecem no SGQ
-  const saida = []; let dados = 0;
-  aoa.forEach(r => {   // cabeçalho e títulos ficam; linha de FVS fica só se o local dela foi lançado nesta FVS (não depende da posição da coluna)
-    if (r.every(v => String(v).trim() === '')) return;   // tira as linhas em branco que sobravam
-    const codigo = r.map(v => String(v).trim()).find(v => /^FVS \d/.test(v));
-    if (!codigo) { saida.push(r); return; }
-    if (r.some(v => pares.has(codigo + '|' + normLoc(String(v))))) { saida.push(r); dados++; }
-  });
-  let bytes, msg;
-  if (dados) {
-    const nova = XLSX.utils.aoa_to_sheet(saida);
-    if (ws['!cols']) nova['!cols'] = ws['!cols'];
-    const wb2 = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb2, nova, nomeAba);
-    bytes = new Uint8Array(XLSX.write(wb2, { bookType: 'biff8', type: 'array' }));
-    msg = `✔ Relatório do SGQ com ${dados} linha(s) de FVS.`;
-  } else {   // o arquivo do SGQ veio sem as linhas esperadas: monta a planilha com os mesmos dados conferidos
-    const cab = ['STATUS DA ÁREA', 'NOME DA ÁREA', 'STATUS DO CHECKLIST', 'CÓDIGO DO SERVIÇO', 'NOME DO SERVIÇO', 'LOCAL 1', 'LOCAL 2', 'LOCAL 3', 'LOCAL 4', 'STATUS DA VERIFICAÇÃO', 'DATA DE ABERTURA', 'DATA DE ENCERRAMENTO', 'INSPECIONADO POR', 'APROVADO POR', 'Nº DE ITENS', '% APROVAÇÃO', 'I.R', '% RETRABALHO APROVADO', '% REPROVADO', '% NÃO SE APLICA'];
-    const nova = XLSX.utils.aoa_to_sheet([cab, ...linhas.map(c => c.slice(0, 20))]);
-    const wb2 = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb2, nova, 'FVS');
-    bytes = new Uint8Array(XLSX.write(wb2, { bookType: 'biff8', type: 'array' }));
-    msg = `⚠ O arquivo do SGQ veio sem as linhas esperadas; a planilha foi montada com ${linhas.length} local(is) conferidos.`;
-  }
-  FVS_MSG = msg; render();
-  baixar(nomePdf('f') + '.xls', bytes, 'application/vnd.ms-excel');
+  FVS_MSG = '⏳ Baixando o relatório do SGQ…'; render();
+  const xls = await relatorioFvs(p.ids, p.ar.ids, 'application/vnd.ms-excel');   // arquivo do SGQ, sem alteração
+  FVS_MSG = '✔ Relatório do SGQ baixado. Apague estas linhas, que não são desta medição: FVS 004 BLOCO 05; FVS 002 A2 BLOCOS 03, 04 e 12.'; render();
+  baixar(nomePdf('f') + '.xls', b64bytes(xls.bytes), 'application/vnd.ms-excel');
 }
 async function imprimir(kind) {
   if (kind === 'fx') { try { await gerarFvsXls(); } catch (e) { FVS_MSG = '⚠ ' + e.message; render(); alert('FVS: ' + e.message); } return; }
