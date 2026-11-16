@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MedPrime — Medição Prime Clube
 // @namespace    realiza.primeclube.medprime
-// @version      1.7.10
+// @version      1.8.2
 // @description  Painel de medição de empreiteiros do Prime Clube dentro do plane: lançar, boletim, croqui, conferir com o plane, contrato e base de preços. SÓ LÊ o plane (GET), nunca grava nada nele.
 // @match        https://plane.realizaconstrutora.com.br/*
 // @match        https://gdol.sgq2.com.br/*
@@ -19,7 +19,7 @@
 /* eslint-disable */
 (function () {
 'use strict';
-const VERSAO = '1.7.10';
+const VERSAO = '1.8.2';
 const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 // ---------------- no SGQ: o MedPrime só COPIA (lê) a lista de FVS e de áreas da obra que o próprio SGQ guarda no navegador. Não mexe em nada.
 if (/(^|\.)sgq2\.com\.br$/.test(location.hostname)) {
@@ -556,7 +556,7 @@ function render() {
   status();
   const f = { resumo: vResumo, lancar: vLancar, boletim: vBoletim, croqui: vCroqui, conferir: vConferir, contrato: vContrato, base: vBase, plane: vPlane, config: vConfig }[VIEW];
   const sc = $('#cnt').scrollTop;
-  $('#cnt').innerHTML = (VIEW === 'config' ? '' : boxLeitura(VIEW === 'base')) + f();
+  $('#cnt').innerHTML = (VIEW === 'config' ? '' : boxLeitura(VIEW === 'base')) + ((VIEW === 'lancar' || VIEW === 'resumo') && S.lanc ? boxDuplicidade() : '') + f();
   if (VIEW === 'lancar' || VIEW === 'base') $('#cnt').scrollTop = sc;
 }
 function selAba(id) {
@@ -792,6 +792,24 @@ function areasDoSGQ(linhasDoc) {
   quer.forEach(n => { const id = porNome[semac(n)]; if (id && ids.indexOf(id) < 0) { ids.push(id); nomes.push(n); } });
   return { ids, nomes, naoAchou: Array.from(quer).filter(n => !porNome[semac(n)]) };
 }
+// ---------------- DUPLICIDADE / RETRABALHO (só alerta; o pagamento não é bloqueado)
+const normServ = s => semac(s).replace(/\s+/g, ' ').trim().replace(/^\d+\s*-\s*/, '');
+function alertasDuplicidade(aba, per) {
+  const atuais = linhas(aba, per, 'E').filter(l => !ehDesconto(l));
+  const anteriores = S.lanc.filter(l => l.aba === aba && (l.tipo || 'E') === 'E' && !l.fora && l.per && l.per < per && !ehDesconto(l));
+  const out = [];
+  atuais.forEach(l => {
+    const sv = normServ(l.serv);
+    const ant = anteriores.filter(x => normServ(x.serv) === sv);
+    if (!ant.length) return;
+    const kA = new Set(chavesDaLinha(l.local, l.obs, l.serv).chaves);
+    if (!kA.size) return;
+    const iguais = ant.filter(x => chavesDaLinha(x.local, x.obs, x.serv).chaves.some(k => kA.has(k)));
+    if (!iguais.length) return;
+    out.push({ l, ret: /RETRABALHO/i.test(`${l.serv} ${l.obs || ''}`), medicoes: Array.from(new Set(iguais.map(x => x.per))).sort(), locais: Array.from(new Set(iguais.map(x => x.local))) });
+  });
+  return out;
+}
 function gmPost(url, corpo, headers) {
   return new Promise((ok, falha) => {
     if (typeof GM_xmlhttpRequest !== 'function') { falha(new Error('o Tampermonkey não liberou o acesso ao SGQ (reinstale o script)')); return; }
@@ -884,6 +902,15 @@ async function fvsRelatorio() {   // devolve o HTML organizado (ou lança erro c
   FVS_MSG = `✔ ${linhas.length} local(is) de FVS encontrados no SGQ.`; render();
   return fvsDoc(linhas, p.d);
 }
+function boxDuplicidade() {
+  const a = S.abas.find(x => x.nome === ABA) || S.abas[0]; if (!a) return '';
+  const itens = alertasDuplicidade(a.nome, S.dataMed); if (!itens.length) return '';
+  const nRet = itens.filter(x => x.ret).length, nDup = itens.length - nRet;
+  return `<div class="box" style="background:#FDE9D9;border-color:#C55A11;margin-bottom:10px"><b>⚠ ${esc(a.nome)}: ${itens.length} lançamento(s) já pagos em medição anterior</b>
+   <div class="muted">${nRet} retrabalho(s) · ${nDup} duplicidade(s). Não bloqueia o pagamento: confira antes de pagar.</div>
+   <table style="margin-top:6px;font-size:12px"><tr><th>Tipo</th><th>Serviço</th><th>Local</th><th>Já pago em</th></tr>
+   ${itens.map(x => `<tr><td>${x.ret ? '<b style="color:#C55A11">RETRABALHO</b>' : 'DUPLICIDADE'}</td><td>${esc(x.l.serv)}</td><td>${esc(x.l.local)}</td><td>${x.medicoes.map(m => br(m)).join(', ')}</td></tr>`).join('')}</table></div>`;
+}
 function boxFvs() {
   const g = sgq();
   if (!g) return `<div class="box" style="background:#FFF2CC;border-color:#F4B183">📋 <b>FVS do SGQ:</b> para gerar a FVS junto com a medição, abra o <a href="https://gdol.sgq2.com.br" target="_blank" class="link">SGQ</a> (já logado) e entre na <b>Checklist de Área</b> da obra uma vez. O MedPrime copia a lista de FVS e de áreas sozinho; depois volte aqui.</div>`;
@@ -954,14 +981,66 @@ function xlsxBytes(rows) {
     { name: 'xl/worksheets/sheet1.xml', data: enc(H + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sd}</sheetData></worksheet>`) },
   ]);
 }
+// Excel com visual do SGQ (título, faixa, cabeçalho cinza, bordas, quebra de linha) — um arquivo só
+function xlsxEstilizado(cols, linhas, cab) {
+  const xm = v => String(v == null ? '' : v).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch])).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  const L = i => String.fromCharCode(65 + i);
+  const fim = L(cols - 1);
+  const cel = (ref, txt, st) => `<c r="${ref}" s="${st}" t="inlineStr"><is><t xml:space="preserve">${xm(txt)}</t></is></c>`;
+  const linha = (n, celulas, ht) => `<row r="${n}"${ht ? ` ht="${ht}" customHeight="1"` : ''}>${celulas}</row>`;
+  let r = 0; const rows = [];
+  rows.push(linha(++r, cel('A' + r, cab.titulo, 1), 22));
+  rows.push(linha(++r, cel('A' + r, cab.sub, 0), 15));
+  rows.push(linha(++r, cel('A' + r, '062 - Prime Clube - Uberlândia MG', 4) + Array.from({ length: cols - 1 }, (_, i) => cel(L(i + 1) + r, '', 4)).join(''), 16));
+  rows.push(linha(++r, cab.cols.map((h, i) => cel(L(i) + r, h, 2)).join(''), 34));
+  linhas.forEach(c => { rows.push(linha(++r, c.slice(0, cols).map((v, i) => cel(L(i) + r, v, 3)).join(''))); });
+  const merges = [`A1:${fim}1`, `A2:${fim}2`, `A3:${fim}3`];
+  const larg = [14, 24, 14, 14, 34, 12, 12, 12, 12, 16, 12, 12, 22, 22, 10, 12, 12, 14, 12, 14];
+  const colsXml = '<cols>' + larg.slice(0, cols).map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('') + '</cols>';
+  const sheet = `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${colsXml}<sheetData>${rows.join('')}</sheetData><mergeCells count="${merges.length}">${merges.map(m => `<mergeCell ref="${m}"/>`).join('')}</mergeCells></worksheet>`;
+  const H = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  const styles = H + `<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="3"><font><sz val="9"/><name val="Arial"/></font><font><b/><sz val="9"/><name val="Arial"/></font><font><b/><sz val="13"/><color rgb="FF1F3864"/><name val="Arial"/></font></fonts>
+<fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9D9D9"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFBFBFBF"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color rgb="FF8C8C8C"/></left><right style="thin"><color rgb="FF8C8C8C"/></right><top style="thin"><color rgb="FF8C8C8C"/></top><bottom style="thin"><color rgb="FF8C8C8C"/></bottom><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="5">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center"/></xf>
+<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="1" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>
+</cellXfs></styleSheet>`;
+  const enc = x => new TextEncoder().encode(x);
+  return zipStore([
+    { name: '[Content_Types].xml', data: enc(H + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>') },
+    { name: '_rels/.rels', data: enc(H + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>') },
+    { name: 'xl/workbook.xml', data: enc(H + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="FVS" sheetId="1" r:id="rId1"/></sheets></workbook>') },
+    { name: 'xl/_rels/workbook.xml.rels', data: enc(H + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>') },
+    { name: 'xl/styles.xml', data: enc(styles) },
+    { name: 'xl/worksheets/sheet1.xml', data: enc(H + sheet) },
+  ]);
+}
 async function gerarFvsXls() {   // baixa o Excel exatamente como o SGQ gera (sem mexer no arquivo)
   const p = pedidoFvs();
   if (!p.ids.length) throw new Error('nenhum serviço deste empreiteiro está ligado a uma FVS — escolha a FVS de cada serviço no quadro "FVS do SGQ"');
-  const linhas = await fvsLinhasDoPedido(p);
-  if (!linhas.length) throw new Error(erroFvs(p));
+  if (!p.ar.ids.length) throw new Error('nenhum local medido bateu com as áreas do SGQ' + (p.ar.naoAchou && p.ar.naoAchou.length ? ': ' + p.ar.naoAchou.join('; ') : '') + '. Abra o SGQ (logado) na Checklist de Área e tente de novo.');
+  FVS_MSG = '⏳ Conferindo os locais no SGQ…'; render();
+  // locais que devem ficar (por FVS, só nos locais medidos) — usado para avisar quais linhas apagar no Excel
+  let certas = [], extras = [];
+  try {
+    certas = await fvsLinhasDoPedido(p);
+    const chaves = new Set(certas.map(c => c.join('|')));
+    const junto = fvsLinhas((await relatorioFvs(p.ids, p.ar.ids, 'text/html')).bytes);
+    extras = junto.filter(c => !chaves.has(c.join('|')));
+  } catch (e) { p.diag = (p.diag || []).concat(['conferência: ' + e.message]); }
   FVS_MSG = '⏳ Baixando o relatório do SGQ…'; render();
   const xls = await relatorioFvs(p.ids, p.ar.ids, 'application/vnd.ms-excel');   // arquivo do SGQ, sem alteração
-  FVS_MSG = '✔ Relatório do SGQ baixado. Apague estas linhas, que não são desta medição: FVS 004 BLOCO 05; FVS 002 A2 BLOCOS 03, 04 e 12.'; render();
+  const lista = Array.from(new Set(extras.map(c => `${c[3].slice(0, 40)} · ${c[1]}`)));
+  FVS_MSG = lista.length
+    ? '✔ Relatório do SGQ baixado. Apague estas linhas, que não são desta medição: ' + lista.join('; ') + '.'
+    : (certas.length ? '✔ Relatório do SGQ baixado. Nenhuma linha extra encontrada.' : '✔ Relatório do SGQ baixado, mas não consegui conferir as linhas. Confira o arquivo.' + (p.diag ? ' (' + p.diag.join(' | ') + ')' : ''));
+  render();
   baixar(nomePdf('f') + '.xls', b64bytes(xls.bytes), 'application/vnd.ms-excel');
 }
 async function imprimir(kind) {
